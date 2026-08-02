@@ -46,7 +46,9 @@ func sigTERM() os.Signal {
 	return syscall.SIGTERM
 }
 
-// processAlive reports whether a PID is currently alive. Best-effort.
+// processAlive reports whether a PID is currently alive (and not a zombie).
+// Best-effort. A zombie still answers signal 0, so on Linux we read /proc to
+// distinguish a real process from an unreaped zombie.
 func processAlive(pid int) bool {
 	if runtimeGOOS == "windows" {
 		// On Windows, use OpenProcess with a query right: a nil handle/error
@@ -60,6 +62,13 @@ func processAlive(pid int) bool {
 	// signal 0 == existence check on Unix
 	if err := proc.Signal(syscall.Signal(0)); err != nil {
 		return false
+	}
+	// On Linux, /proc/<pid>/stat's third field is the state; 'Z' is a zombie
+	// (dead, awaiting reaping). Treat zombies as not alive.
+	if runtimeGOOS == "linux" {
+		if state := linuxProcState(pid); state == "Z" {
+			return false
+		}
 	}
 	return true
 }
