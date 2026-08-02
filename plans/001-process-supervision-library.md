@@ -27,7 +27,7 @@ T1 so future test files are discoverable.
 ## Progress
 
 - [x] T1: Module bootstrap and CI matrix
-- [ ] T2: Self re-exec test child harness
+- [x] T2: Self re-exec test child harness
 - [ ] T3: Core types and `Start` with a single reaper
 - [ ] T4: `Stop` and `StopAll` with escalation
 - [ ] T5: Standardised output capture
