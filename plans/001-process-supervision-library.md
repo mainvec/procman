@@ -31,7 +31,7 @@ T1 so future test files are discoverable.
 - [x] T3: Core types and `Start` with a single reaper
 - [x] T4: `Stop` and `StopAll` with escalation
 - [x] T5: Standardised output capture
-- [ ] T6: `Supervisor` registry and `OnExit`
+- [x] T6: `Supervisor` registry and `OnExit`
 - [ ] T7: Unix process-group seam
 - [ ] T8: Windows Job Object seam
 - [ ] T9: Watchdog sidecar — protocol and spawn ordering
@@ -397,6 +397,13 @@ start/stop cycles. A duplicate name is rejected. `Close` is idempotent.
 
 **Notes**: `OnExit` runs on the reaper goroutine. Document that it must not block, or dispatch it
 on its own goroutine per callback — decide during implementation and record it here.
+
+**Decision (2026-08-02)**: `OnExit` fires **before** `Done()` closes, on the reaper goroutine, and
+must not block. The ordering contract is: `Done()` closed ⇒ `Exit()` is populated **and** `OnExit`
+has already run. This lets a caller wait on `Done()` and then read `OnExit`'s effects without a
+race. Dispatching on its own goroutine was rejected: it would lose the "OnExit has run before
+`Done()` closes" guarantee that callers rely on, and a blocking callback is the caller's bug to
+fix, not ours to paper over.
 
 ### T7: Unix process-group seam
 

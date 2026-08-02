@@ -180,23 +180,32 @@ func (p *Process) reap(cmd *exec.Cmd) {
 // publishExit records the per-generation exit, fires OnExit once, and decides
 // whether the process is terminal. For T3 (RestartNever), every exit is
 // terminal: Done() closes and the entry leaves the registry.
+//
+// Ordering contract: OnExit fires BEFORE Done() closes, so a caller waiting
+// on Done() can rely on OnExit having already run. OnExit runs on the reaper
+// goroutine and must not block.
 func (p *Process) publishExit(info ExitInfo) {
 	p.mu.Lock()
 	p.pid = 0
 	isTerminal := true
 	p.setStateLocked(StateExited)
+	onExit := p.sup.opts.OnExit
 	if isTerminal && !p.closed {
 		p.exitInfo = info
 		p.exitOk = true
 		p.closed = true
-		close(p.done)
 	}
-	onExit := p.sup.opts.OnExit
 	p.mu.Unlock()
 
-	if onExit != nil {
+	if isTerminal && onExit != nil {
 		onExit(p, info)
 	}
+
+	p.mu.Lock()
+	if isTerminal && p.closed {
+		close(p.done)
+	}
+	p.mu.Unlock()
 
 	if isTerminal {
 		p.sup.unregister(p)
