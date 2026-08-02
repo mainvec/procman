@@ -30,7 +30,7 @@ T1 so future test files are discoverable.
 - [x] T2: Self re-exec test child harness
 - [x] T3: Core types and `Start` with a single reaper
 - [x] T4: `Stop` and `StopAll` with escalation
-- [ ] T5: Standardised output capture
+- [x] T5: Standardised output capture
 - [ ] T6: `Supervisor` registry and `OnExit`
 - [ ] T7: Unix process-group seam
 - [ ] T8: Windows Job Object seam

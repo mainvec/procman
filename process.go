@@ -27,6 +27,11 @@ type Process struct {
 	closed   bool
 	exitInfo ExitInfo
 	exitOk   bool
+
+	// out captures this generation's stdout/stderr. Replaced on each
+	// restart (T11) so the ring is per-generation.
+	outMu sync.Mutex
+	out   *outputSet
 }
 
 // Name returns the Spec.Name.
@@ -76,10 +81,15 @@ func (p *Process) Exit() (ExitInfo, bool) {
 	return p.exitInfo, p.exitOk
 }
 
-// LogTail returns the retained ring-buffer lines, if any.
+// LogTail returns the retained ring-buffer lines, in arrival order. Lines
+// from stdout precede lines from stderr in the combined tail.
 func (p *Process) LogTail() []Line {
-	// Output capture (T5) populates this; T3 returns nil.
-	return nil
+	p.outMu.Lock()
+	defer p.outMu.Unlock()
+	if p.out == nil {
+		return nil
+	}
+	return p.out.tail()
 }
 
 // setStateLocked must be called with mu held.
@@ -95,6 +105,16 @@ func (p *Process) startGeneration(ctx context.Context) (*exec.Cmd, error) {
 	cmd.Env = p.spec.Env
 	cmd.Dir = p.spec.Dir
 	prepareChildCmd(cmd)
+
+	// Attach output collectors (not StdoutPipe): exec owns the pipe lifetime
+	// and Wait joins the copier. A fresh collector set per generation so the
+	// ring is per-generation.
+	outSet := newOutputSet(p.spec)
+	p.outMu.Lock()
+	p.out = outSet
+	p.outMu.Unlock()
+	cmd.Stdout = outSet.stdout
+	cmd.Stderr = outSet.stderr
 
 	p.mu.Lock()
 	p.gen++
@@ -121,6 +141,14 @@ func (p *Process) startGeneration(ctx context.Context) (*exec.Cmd, error) {
 // reap calls cmd.Wait exactly once and publishes the result.
 func (p *Process) reap(cmd *exec.Cmd) {
 	waitErr := cmd.Wait()
+
+	// Flush any residual partial line now that the stream is closed, so a
+	// final line without a trailing newline is not lost.
+	p.outMu.Lock()
+	if p.out != nil {
+		p.out.flush()
+	}
+	p.outMu.Unlock()
 
 	info := ExitInfo{
 		ExitedAt:   time.Now().UTC(),
