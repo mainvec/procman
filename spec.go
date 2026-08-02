@@ -155,8 +155,12 @@ func (e *StartError) Unwrap() error { return e.Err }
 
 // Sentinel errors.
 var (
-	ErrNotRunning        = errors.New("procman: process not running")
-	ErrAlreadyRunning    = errors.New("procman: process already running")
-	ErrDuplicateName     = errors.New("procman: duplicate process name")
+	ErrNotRunning             = errors.New("procman: process not running")
+	ErrAlreadyRunning         = errors.New("procman: process already running")
+	ErrDuplicateName          = errors.New("procman: duplicate process name")
 	ErrRestartBudgetExhausted = errors.New("procman: restart budget exhausted")
+	// ErrStopEscalated is returned by Stop when the child did not exit within
+	// StopGrace and Stop had to escalate from a graceful signal to a hard
+	// kill. The error wraps the underlying kill error, if any.
+	ErrStopEscalated = errors.New("procman: stop escalated to hard kill")
 )

@@ -16,6 +16,10 @@ import (
 // itoa is strconv.Itoa to avoid the import in the test files above.
 func itoa(i int) string { return strconv.Itoa(i) }
 
+// runtimeGOOS exposes the current GOOS for Unix-only test gating without each
+// test file importing runtime.
+var runtimeGOOS = runtime.GOOS
+
 // testChildExe returns the test binary path and Env for the supervisor tests.
 func testChildExe(t *testing.T) string {
 	t.Helper()

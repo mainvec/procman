@@ -2,6 +2,7 @@ package procman
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"sync"
@@ -186,9 +187,11 @@ func signalFromProcessState(ps *os.ProcessState) string {
 	return signalName(ps)
 }
 
-// stop signals the process to stop. For T3 it sends SIGTERM-equivalent to the
-// direct process only (group kill arrives in T4/T7/T8). Idempotent and a no-op
-// for an already-exited process.
+// stop signals the process to stop: sends a graceful signal, waits
+// StopGrace, escalates to a hard kill if needed, and waits on the reaper
+// (never on cmd.Wait directly). Idempotent and a no-op returning nil for an
+// already-exited process. Returns ErrStopEscalated when a hard kill was
+// required, wrapping any error from the kill itself.
 func (p *Process) stop(ctx context.Context) error {
 	p.mu.Lock()
 	pid := p.pid
@@ -201,14 +204,18 @@ func (p *Process) stop(ctx context.Context) error {
 	proc, err := os.FindProcess(pid)
 	p.mu.Unlock()
 	if err != nil {
+		// FindProcess never errors on Unix; nil is safe on Windows.
 		return nil
 	}
+	// Graceful signal. ESRCH (process gone) is not an error: the reaper is
+	// handling it.
 	if err := signalTerm(proc); err != nil {
-		// Best-effort; escalate below regardless.
-		_ = err
+		if !isAlreadyGone(err) {
+			_ = err // best-effort; escalate below regardless
+		}
 	}
 
-	// Wait up to StopGrace, then escalate to a hard kill.
+	// Wait up to StopGrace for a graceful exit, then escalate to a hard kill.
 	grace := p.spec.StopGrace
 	if grace <= 0 {
 		grace = 5 * time.Second
@@ -221,6 +228,7 @@ func (p *Process) stop(ctx context.Context) error {
 	case <-timer.C:
 	}
 
+	// Escalation: the child ignored the graceful signal.
 	p.mu.Lock()
 	pid = p.pid
 	if pid == 0 {
@@ -232,15 +240,18 @@ func (p *Process) stop(ctx context.Context) error {
 	if err != nil {
 		return nil
 	}
-	if err := signalKill(proc2); err != nil {
-		return err
-	}
+	killErr := signalKill(proc2)
 	select {
 	case <-p.done:
+		// Escalation succeeded. Report that escalation was needed; wrap the
+		// kill error if there was one (do not swallow it).
+		if killErr != nil && !isAlreadyGone(killErr) {
+			return fmt.Errorf("%w: %v", ErrStopEscalated, killErr)
+		}
+		return ErrStopEscalated
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	return nil
 }
 
 // ensure atomic package is used (state may use atomic in later tasks).
