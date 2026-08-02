@@ -39,7 +39,7 @@ T1 so future test files are discoverable.
 - [x] T11: Restart policy, backoff and generations
 - [x] T12: Fault-injection suite
 - [x] T13: Documentation, including what this does not protect against
-- [ ] T14: Zero-dependency proof and v0.1.0
+- [x] T14: Zero-dependency proof and v0.1.0
 
 ## Problem / Goal
 
@@ -526,6 +526,11 @@ pays that cost once per spawn.
 
 **Notes**: This is the claim in the repo description; make it mechanically enforced rather than
 aspirational.
+
+**Update (2026-08-02)**: The CI `zero-dependencies` job asserts `go mod graph` (filtered for the
+`go`/`toolchain` self-edges) is empty and fails on any module dependency, including a `tool`
+directive. It is green on ubuntu/macos/windows. The `v0.1.0` tag is created on `main` after PR #2
+merges, per the Rollout section.
 
 ## Risks and Compatibility
 
