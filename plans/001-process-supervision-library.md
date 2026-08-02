@@ -36,7 +36,7 @@ T1 so future test files are discoverable.
 - [x] T8: Windows Job Object seam
 - [x] T9: Watchdog sidecar — protocol and spawn ordering
 - [x] T10: Watchdog sidecar — parent-death tree kill and fallback
-- [ ] T11: Restart policy, backoff and generations
+- [x] T11: Restart policy, backoff and generations
 - [ ] T12: Fault-injection suite
 - [ ] T13: Documentation, including what this does not protect against
 - [ ] T14: Zero-dependency proof and v0.1.0
