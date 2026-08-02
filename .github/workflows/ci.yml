@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.4'
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./... -race -count=1
+
+  zero-dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.4'
+      # go mod graph must produce no module dependencies. The go directive's
+      # self-edge (go@<version>, toolchain@<version>) is not a dependency.
+      - run: |
+          out="$(go mod graph | grep -v '^github.com/mainvec/procman go@' | grep -v '^go@' | grep -v '^go@ toolchain@')"
+          if [ -n "$out" ]; then
+            echo "::error::Unexpected dependencies:"$'\n'"$out"
+            exit 1
+          fi

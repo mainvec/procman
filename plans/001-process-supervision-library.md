@@ -2,13 +2,31 @@
 
 **Type**: feature
 **Module**: procman (root package)
-**GitHub Issue**: _not yet created — create in `mainvec/procman` before implementation starts and
-renumber this file if `001` is taken._
+**GitHub Issue**: [mainvec/procman#1](https://github.com/mainvec/procman/issues/1)
 **Branch**: feat/1-process-supervision-library
+
+## Reconciling with the existing scaffold
+
+The repo already contains early scaffolding that this plan supersedes. The existing types are
+mapped to the new API as follows, and will be **removed** during T1 once their replacements land:
+
+| Existing | Disposition | Replaced by |
+|---|---|---|
+| `procman.go` — `Procman`, `ExecCmd`, `NewExecCmd`, `Start`, `Wait`, `KillAllExecCmdes`, `ListExecCmdes`, `RemoveExecCmd`, `GetExecCmd` | **Remove.** Single-shot `Wait` with no reaper ownership, no group kill, no output capture, and a `context.WithCancel` that double-races with `cmd.Wait`. The `Supervisor`/`Process`/`Spec` API in this plan replaces all of it. | `supervisor.go`, `process.go`, `spec.go` |
+| `procman.go` — `RestartPolicy` enum (`RestartPolicyNever/Always/OnFailure`) | **Remove.** No backoff, no budget, no reset. | `RestartPolicy` struct in `spec.go` |
+| `procman.go` — `ExecCmdStatus` enum | **Remove.** Replaced by `State` (`Starting|Running|Stopping|Restarting|Exited`). | `State` in `spec.go` |
+| `procman.go` — errors `ErrExecCmdNotStarted`, `ErrExecCmdAlreadyStarted` | **Remove.** Replaced by `ErrNotRunning`, `ErrAlreadyRunning`. | errors in `spec.go` |
+| `procman.go` — `StartError` type (planned, not yet present) | **Add.** | `spec.go` |
+| `procman_unix.go`, `procman_windows.go` — `prepareExecCmd`, `prepareChildCmd` stubs | **Remove.** The process-group seam is `group_unix.go`/`group_windows.go` with `newGroupAttrs`/`terminateGroup`/`killGroup`, not a `prepare*` hook. | `group_unix.go`, `group_windows.go` |
+| `procman_util.go` — `ID` (16-byte UUID v4) and `NewID` | **Keep and reuse** as the registry key for `Supervisor.execCmds`. Renamed internally to `processID` for clarity; the `ID` type and `NewID` stay exported for caller use. | — |
+| `procmac_test.go` (note the typo in the filename) — `TestNewProcman` | **Remove and rename file to `procman_test.go`.** Replaced by the T3 test suite driving the new `Supervisor` API. | `procman_test.go` |
+
+The filename `procmac_test.go` (missing the `n`) is a typo; it is renamed to `procman_test.go` in
+T1 so future test files are discoverable.
 
 ## Progress
 
-- [ ] T1: Module bootstrap and CI matrix
+- [x] T1: Module bootstrap and CI matrix
 - [ ] T2: Self re-exec test child harness
 - [ ] T3: Core types and `Start` with a single reaper
 - [ ] T4: `Stop` and `StopAll` with escalation
@@ -287,12 +305,17 @@ New module `github.com/mainvec/procman`, single root package:
 | `supervisor.go` | — | `Supervisor`, registry, `Start`/`Stop`/`StopAll`/`List`/`Get`/`Close` |
 | `process.go` | — | `Process`, reaper, restart loop, generations |
 | `output.go` | — | fan-out writer, line splitter, ring buffer |
+| `id.go` | — | `ID`, `NewID` (retained from `procman_util.go`; renamed for discoverability) |
 | `watchdog_unix.go` | `unix` | sidecar spawn, fd-3 protocol, shell script, pgid arming |
 | `watchdog_fallback.go` | `unix` | `init()` hook, `RunWatchdogAndExit`, Go watchdog loop |
 | `watchdog_stub.go` | `!unix` | no-op `init()` hook and `RunWatchdogAndExit` |
 | `group_unix.go` | `unix` | `newGroupAttrs`, `terminateGroup`, `killGroup` |
 | `group_windows.go` | `windows` | same three, via Job Object |
 | `testchild_test.go` | — | self re-exec fake child |
+| `procman_test.go` | — | renamed from `procmac_test.go`; T3+ suites |
+
+**Removed during T1**: `procman.go` (scaffold), `procman_unix.go`, `procman_windows.go`,
+`procman_util.go` (moved to `id.go`).
 
 ## Tasks
 
@@ -306,7 +329,10 @@ package doc. GitHub Actions running build, vet and test on `ubuntu-latest`, `mac
 
 **Notes**: Linters must **not** be added as `tool` directives in `go.mod` — that is exactly what
 disqualifies `proctree` from being dependency-free. Run `golangci-lint` from a pinned action or
-not at all.
+not at all. T1 also removes the existing scaffold (`procman.go`, `procman_unix.go`,
+`procman_windows.go`) and moves `procman_util.go` → `id.go`; `procmac_test.go` is renamed to
+`procman_test.go`. The scaffold removal lands in the same commit as the new `doc.go` so the tree
+never has two competing APIs at once.
 
 ### T2: Self re-exec test child harness
 
