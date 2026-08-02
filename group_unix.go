@@ -63,6 +63,13 @@ func groupProcessFor(pgid int) (*os.Process, error) {
 	return os.FindProcess(-pgid)
 }
 
+// assignToGroupHandle assigns the just-started child to its group/container.
+// On Unix the group is established by Setpgid in prepareChildCmdPlatform, so
+// there is no handle to return — the kernel owns the group.
+func assignToGroupHandle(cmd *exec.Cmd) (groupHandle, error) {
+	return nil, nil
+}
+
 // signalTermGroup sends SIGTERM to the whole process group. On Unix the child
 // is its own group leader (Setpgid), so pgid == pid; kill(-pgid, SIGTERM)
 // reaches it and all descendants.

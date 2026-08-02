@@ -32,6 +32,10 @@ type Process struct {
 	// restart (T11) so the ring is per-generation.
 	outMu sync.Mutex
 	out   *outputSet
+
+	// group holds the platform group/container handle (Job Object on
+	// Windows; nil on Unix where the process group is kernel-managed).
+	group groupHandle
 }
 
 // Name returns the Spec.Name.
@@ -127,9 +131,22 @@ func (p *Process) startGeneration(ctx context.Context) (*exec.Cmd, error) {
 		return nil, err
 	}
 
+	// Assign the child to its group/container (Job Object on Windows). On
+	// Unix this returns nil since Setpgid already established the group.
+	// There is a small unprotected window here on Windows between Start and
+	// assignment; documented in the plan (T8).
+	gh, err := assignToGroupHandle(cmd)
+	if err != nil {
+		// Assignment failed: kill the child we just started and fail Start,
+		// rather than proceeding without the parent-death guarantee.
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+		return nil, err
+	}
 	p.mu.Lock()
 	p.pid = cmd.Process.Pid
 	p.state = StateRunning
+	p.group = gh
 	p.mu.Unlock()
 
 	// Single reaper goroutine: the only owner of cmd.Wait() for this
@@ -149,6 +166,16 @@ func (p *Process) reap(cmd *exec.Cmd) {
 		p.out.flush()
 	}
 	p.outMu.Unlock()
+
+	// Release the platform group/container handle (Job Object on Windows).
+	// On Unix this is nil. Closing after the process has exited is safe.
+	p.mu.Lock()
+	gh := p.group
+	p.group = nil
+	p.mu.Unlock()
+	if gh != nil {
+		gh.close()
+	}
 
 	info := ExitInfo{
 		ExitedAt:   time.Now().UTC(),
@@ -239,15 +266,23 @@ func (p *Process) stop(ctx context.Context) error {
 	}
 	p.setStateLocked(StateStopping)
 	proc, err := os.FindProcess(pid)
+	gh := p.group
 	p.mu.Unlock()
 	if err != nil {
 		// FindProcess never errors on Unix; nil is safe on Windows.
 		return nil
 	}
-	// Graceful signal to the whole group (Unix) or the single process
-	// (Windows). ESRCH (process gone) is not an error: the reaper is
-	// handling it.
-	if err := signalTermGroup(proc, pid); err != nil {
+	// Graceful stop of the whole group. On Unix this is kill(-pgid, SIGTERM);
+	// on Windows the Job Object has no graceful mode, so we terminate the
+	// whole job (hard kill) — there is no SIGTERM equivalent. ESRCH / already
+	// gone is not an error: the reaper is handling it.
+	if gh != nil {
+		if err := gh.terminate(); err != nil {
+			if !isAlreadyGone(err) {
+				_ = err
+			}
+		}
+	} else if err := signalTermGroup(proc, pid); err != nil {
 		if !isAlreadyGone(err) {
 			_ = err // best-effort; escalate below regardless
 		}
@@ -266,7 +301,8 @@ func (p *Process) stop(ctx context.Context) error {
 	case <-timer.C:
 	}
 
-	// Escalation: the child ignored the graceful signal.
+	// Escalation: the child ignored the graceful signal (Unix), or the Job
+	// Object termination did not complete in time (Windows).
 	p.mu.Lock()
 	pid = p.pid
 	if pid == 0 {
@@ -274,11 +310,17 @@ func (p *Process) stop(ctx context.Context) error {
 		return nil
 	}
 	proc2, err := os.FindProcess(pid)
+	gh2 := p.group
 	p.mu.Unlock()
 	if err != nil {
 		return nil
 	}
-	killErr := signalKillGroup(proc2, pid)
+	var killErr error
+	if gh2 != nil {
+		killErr = gh2.terminate()
+	} else {
+		killErr = signalKillGroup(proc2, pid)
+	}
 	select {
 	case <-p.done:
 		// Escalation succeeded. Report that escalation was needed; wrap the
