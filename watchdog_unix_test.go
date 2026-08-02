@@ -144,8 +144,8 @@ func watchdogScript(graceSec int) string {
 	return strings.Join([]string{
 		"read pgid <&3 || exit 0",
 		"read done <&3 && exit 0",
-		"kill -TERM -- -$pgid 2>/dev/null",
+		`kill -TERM -"$pgid" 2>/dev/null`,
 		"sleep " + itoa(graceSec),
-		"kill -KILL -- -$pgid 2>/dev/null",
+		`kill -KILL -"$pgid" 2>/dev/null`,
 	}, "\n")
 }

@@ -16,20 +16,22 @@ import (
 //
 //	read pgid <&3 || exit 0        # parent died before arming; nothing to kill
 //	read done <&3 && exit 0        # parent stood us down; target exited
-//	kill -TERM -- -$pgid 2>/dev/null
+//	kill -TERM -"$pgid" 2>/dev/null
 //	sleep $grace
-//	kill -KILL -- -$pgid 2>/dev/null
+//	kill -KILL -"$pgid" 2>/dev/null
 //
 // No user-controlled data is interpolated: the pgid arrives over the pipe and
 // is validated as an integer before use. Only the grace (a caller-supplied
 // duration, converted to whole seconds) is embedded as a numeric literal.
+// The negative-pid form without "--" is portable across dash, bash and ash;
+// the "--" delimiter is not universally accepted by dash's kill builtin.
 func watchdogScript(graceSec int) string {
 	return strings.Join([]string{
 		"read pgid <&3 || exit 0",
 		"read done <&3 && exit 0",
-		"kill -TERM -- -$pgid 2>/dev/null",
+		`kill -TERM -"$pgid" 2>/dev/null`,
 		"sleep " + strconv.Itoa(graceSec),
-		"kill -KILL -- -$pgid 2>/dev/null",
+		`kill -KILL -"$pgid" 2>/dev/null`,
 	}, "\n")
 }
 
