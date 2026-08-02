@@ -36,7 +36,10 @@
 //
 //   - The Unix watchdog can be killed independently by PID; it is a process,
 //     not a kernel guarantee.
-//   - A child that calls setsid() escapes its process group on Unix.
+//   - A supervised child is a process-group leader (Setpgid), so a direct
+//     setsid() from it fails with EPERM and it cannot escape. A grandchild
+//     that calls setsid() is not a leader and escapes its process group on
+//     Unix; procman does not track descendants that detach.
 //   - Options.Watchdog set to WatchdogOff opts out of the parent-death
 //     guarantee entirely.
 //   - On Windows there is a brief unprotected window between cmd.Start and

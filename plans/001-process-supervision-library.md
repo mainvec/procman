@@ -38,7 +38,7 @@ T1 so future test files are discoverable.
 - [x] T10: Watchdog sidecar — parent-death tree kill and fallback
 - [x] T11: Restart policy, backoff and generations
 - [x] T12: Fault-injection suite
-- [ ] T13: Documentation, including what this does not protect against
+- [x] T13: Documentation, including what this does not protect against
 - [ ] T14: Zero-dependency proof and v0.1.0
 
 ## Problem / Goal
