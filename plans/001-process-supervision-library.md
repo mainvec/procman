@@ -32,7 +32,7 @@ T1 so future test files are discoverable.
 - [x] T4: `Stop` and `StopAll` with escalation
 - [x] T5: Standardised output capture
 - [x] T6: `Supervisor` registry and `OnExit`
-- [ ] T7: Unix process-group seam
+- [x] T7: Unix process-group seam
 - [ ] T8: Windows Job Object seam
 - [ ] T9: Watchdog sidecar — protocol and spawn ordering
 - [ ] T10: Watchdog sidecar — parent-death tree kill and fallback

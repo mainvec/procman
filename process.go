@@ -244,9 +244,10 @@ func (p *Process) stop(ctx context.Context) error {
 		// FindProcess never errors on Unix; nil is safe on Windows.
 		return nil
 	}
-	// Graceful signal. ESRCH (process gone) is not an error: the reaper is
+	// Graceful signal to the whole group (Unix) or the single process
+	// (Windows). ESRCH (process gone) is not an error: the reaper is
 	// handling it.
-	if err := signalTerm(proc); err != nil {
+	if err := signalTermGroup(proc, pid); err != nil {
 		if !isAlreadyGone(err) {
 			_ = err // best-effort; escalate below regardless
 		}
@@ -277,7 +278,7 @@ func (p *Process) stop(ctx context.Context) error {
 	if err != nil {
 		return nil
 	}
-	killErr := signalKill(proc2)
+	killErr := signalKillGroup(proc2, pid)
 	select {
 	case <-p.done:
 		// Escalation succeeded. Report that escalation was needed; wrap the
