@@ -37,7 +37,7 @@ T1 so future test files are discoverable.
 - [x] T9: Watchdog sidecar — protocol and spawn ordering
 - [x] T10: Watchdog sidecar — parent-death tree kill and fallback
 - [x] T11: Restart policy, backoff and generations
-- [ ] T12: Fault-injection suite
+- [x] T12: Fault-injection suite
 - [ ] T13: Documentation, including what this does not protect against
 - [ ] T14: Zero-dependency proof and v0.1.0
 
@@ -492,6 +492,15 @@ the test confirmed to fail.
 **Notes**: The `setsid()` and watchdog-killed cases are expected to *fail to contain* the child on
 Unix. They exist to pin the documented limitation, so they assert the known outcome rather than
 success.
+
+**Update (2026-08-02)**: A *direct* `setsid()` by a supervised child is blocked, not a limitation —
+procman sets `Setpgid`, making the child a process-group leader, and the kernel returns EPERM for
+`setsid()` from a leader, so the child exits non-zero and cannot escape. The genuine limitation is a
+*grandchild* that setsids (it is not a leader); that vector remains documented. The
+watchdog-killed-independently case confirms the escape (grandchildren survive with the watchdog
+gone); it pins the outcome without failing the suite, since CI timing/init-reaping is variable. The
+suite is stable under `-race -count=5` on darwin; the Linux/Windows runners exercise the
+platform-independent subset plus their tagged cases via CI.
 
 ### T13: Documentation, including what this does not protect against
 
