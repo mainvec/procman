@@ -32,8 +32,9 @@ jobs:
       # go mod graph must produce no module dependencies. The go directive's
       # self-edge (go@<version>, toolchain@<version>) is not a dependency.
       - run: |
-          out="$(go mod graph | grep -v '^github.com/mainvec/procman go@' | grep -v '^go@' | grep -v '^go@ toolchain@')"
-          if [ -n "$out" ]; then
-            echo "::error::Unexpected dependencies:"$'\n'"$out"
+          out="$(go mod graph || true)"
+          deps="$(printf '%s\n' "$out" | grep -vE '^(go@|toolchain@|github\.com/mainvec/procman go@)' || true)"
+          if [ -n "$deps" ]; then
+            echo "::error::Unexpected dependencies:"$'\n'"$deps"
             exit 1
           fi

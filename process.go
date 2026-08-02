@@ -36,6 +36,11 @@ type Process struct {
 	// group holds the platform group/container handle (Job Object on
 	// Windows; nil on Unix where the process group is kernel-managed).
 	group groupHandle
+
+	// wd is the Unix sidecar watchdog, if one was spawned for this
+	// generation. nil on Windows or when Watchdog is off.
+	wdCmd  *exec.Cmd
+	wdPipe *os.File
 }
 
 // Name returns the Spec.Name.
@@ -101,9 +106,9 @@ func (p *Process) setStateLocked(s State) { p.state = s }
 
 // startGeneration starts one process generation: launches the child, owns
 // exactly one reaper goroutine that calls cmd.Wait(), and publishes the
-// result. It returns the *exec.Cmd so the supervisor can signal the group.
-//
-// For T3 there is no watchdog and no group kill; cmd.Start is used directly.
+// result. Spawn ordering when the watchdog is enabled is: watchdog → target
+// → write pgid (arm). The watchdog is a sidecar, not in the exec chain, so
+// the parent reaps the target directly and its exit code/signal are real.
 func (p *Process) startGeneration(ctx context.Context) (*exec.Cmd, error) {
 	cmd := exec.CommandContext(ctx, p.spec.Path, p.spec.Args...)
 	cmd.Env = p.spec.Env
@@ -120,6 +125,17 @@ func (p *Process) startGeneration(ctx context.Context) (*exec.Cmd, error) {
 	cmd.Stdout = outSet.stdout
 	cmd.Stderr = outSet.stderr
 
+	// Spawn ordering: watchdog FIRST (before the target), so a parent death
+	// at any point after this has a watcher that knows nothing to kill yet.
+	wdCmd, wdPipe, err := p.sup.spawnWatchdog(p.spec)
+	if err != nil {
+		return nil, err
+	}
+	p.mu.Lock()
+	p.wdCmd = wdCmd
+	p.wdPipe = wdPipe
+	p.mu.Unlock()
+
 	p.mu.Lock()
 	p.gen++
 	p.pid = 0
@@ -128,7 +144,32 @@ func (p *Process) startGeneration(ctx context.Context) (*exec.Cmd, error) {
 	p.mu.Unlock()
 
 	if err := cmd.Start(); err != nil {
+		// Target never started: stand the watchdog down (it reads EOF or the
+		// stand-down line and exits 0). Close the pipe so the watchdog does
+		// not linger.
+		standDownWatchdog(wdPipe)
+		p.mu.Lock()
+		p.wdCmd = nil
+		p.wdPipe = nil
+		p.mu.Unlock()
 		return nil, err
+	}
+
+	// Arm the watchdog: write the target's pgid down fd 3. After this, EOF
+	// on the pipe (parent death) triggers the kill sequence. The pgid equals
+	// the target's pid (Setpgid). There is a sub-millisecond window between
+	// target Start and this write — the minimum possible since the pgid does
+	// not exist until the target does.
+	pgid := cmd.Process.Pid
+	if wdPipe != nil {
+		if armErr := armWatchdog(wdPipe, pgid); armErr != nil {
+			// Arming failed: kill the target we just started and fail Start,
+			// rather than proceeding with an unarmed watchdog.
+			_ = signalKillGroup(cmd.Process, pgid)
+			_, _ = cmd.Process.Wait()
+			standDownWatchdog(wdPipe)
+			return nil, armErr
+		}
 	}
 
 	// Assign the child to its group/container (Job Object on Windows). On
@@ -141,6 +182,11 @@ func (p *Process) startGeneration(ctx context.Context) (*exec.Cmd, error) {
 		// rather than proceeding without the parent-death guarantee.
 		_ = cmd.Process.Kill()
 		_, _ = cmd.Process.Wait()
+		standDownWatchdog(wdPipe)
+		p.mu.Lock()
+		p.wdCmd = nil
+		p.wdPipe = nil
+		p.mu.Unlock()
 		return nil, err
 	}
 	p.mu.Lock()
@@ -166,6 +212,21 @@ func (p *Process) reap(cmd *exec.Cmd) {
 		p.out.flush()
 	}
 	p.outMu.Unlock()
+
+	// Stand the watchdog down: the target has exited, so write the
+	// stand-down line and close the sentinel pipe. The watchdog reads the
+	// line and exits 0 without killing the group. Reap its exit so it does
+	// not become a zombie.
+	p.mu.Lock()
+	wd := p.wdCmd
+	wdPipe := p.wdPipe
+	p.wdCmd = nil
+	p.wdPipe = nil
+	p.mu.Unlock()
+	standDownWatchdog(wdPipe)
+	if wd != nil {
+		_, _ = wd.Process.Wait()
+	}
 
 	// Release the platform group/container handle (Job Object on Windows).
 	// On Unix this is nil. Closing after the process has exited is safe.

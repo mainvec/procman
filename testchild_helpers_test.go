@@ -48,10 +48,10 @@ func sigTERM() os.Signal {
 
 // processAlive reports whether a PID is currently alive. Best-effort.
 func processAlive(pid int) bool {
-	if runtime.GOOS == "windows" {
-		// No portable kill -0 on Windows; assume alive. Windows tests skip
-		// the cases that use this.
-		return true
+	if runtimeGOOS == "windows" {
+		// On Windows, use OpenProcess with a query right: a nil handle/error
+		// means the process is gone.
+		return processAliveWindows(pid)
 	}
 	proc, err := os.FindProcess(pid)
 	if err != nil {
@@ -81,6 +81,16 @@ func killByPID(pid int) error {
 		return nil
 	}
 	return nil
+}
+
+// syscallKillGroup sends a signal to the negative process group (Unix only).
+// Returns nil if any member is alive, an error otherwise. On Windows this is
+// a no-op (process groups are not signal-based).
+func syscallKillGroup(pgid, sig int) error {
+	if runtime.GOOS == "windows" {
+		return os.ErrNotExist
+	}
+	return syscallKillGroupUnix(pgid, sig)
 }
 
 // parsePID extracts the integer after "pid=" in a grandchild announcement line.
