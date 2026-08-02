@@ -42,33 +42,58 @@ func (s *Supervisor) watchdogShell() string {
 	return "/bin/sh"
 }
 
-// spawnWatchdog starts the /bin/sh sidecar with the sentinel pipe on fd 3.
-// It returns the running *exec.Cmd (the watchdog) and the *os.File write-end
-// of the sentinel pipe, which the caller must hold until it writes the
-// stand-down line and closes it. Spawn ordering is watchdog → target → write
-// pgid, so this must be called BEFORE startGeneration launches the target.
-//
-// The returned write-end is the parent's reference to the pipe; os.File has a
-// finalizer that closes the fd, so the caller must keep it reachable until
-// stand-down to avoid a spurious watchdog trigger.
-func (s *Supervisor) spawnWatchdog(spec Spec) (*exec.Cmd, *os.File, error) {
-	// Create the sentinel pipe. The child reads from the read end (fd 3 via
-	// ExtraFiles); the parent holds the write end.
+// watchdog is the unified sidecar handle, whether backed by /bin/sh or the
+// re-exec fallback. The parent holds the sentinel write-end and stands it
+// down on reap; it owns the process so it can be reaped (no zombie).
+type watchdog struct {
+	proc *os.Process
+	pipe *os.File
+	// done is closed when the watchdog process exits.
+	done chan struct{}
+}
+
+// spawnWatchdog starts the /bin/sh sidecar with the sentinel pipe on fd 3,
+// or — when the shell is absent — the re-exec fallback. It returns the
+// watchdog handle whose pipe the caller must keep reachable until stand-down.
+// Spawn ordering is watchdog → target → write pgid, so this is called BEFORE
+// startGeneration launches the target.
+func (s *Supervisor) spawnWatchdog(spec Spec) (*watchdog, error) {
+	shell := s.watchdogShell()
+	if shellAvailable(shell) {
+		return s.spawnShellWatchdog(spec, shell)
+	}
+	// Shell absent: use the re-exec fallback.
+	return s.spawnFallbackWatchdog(spec)
+}
+
+// shellAvailable reports whether the shell path exists and is executable.
+func shellAvailable(shell string) bool {
+	if shell == "" {
+		return false
+	}
+	info, err := os.Stat(shell)
+	if err != nil {
+		return false
+	}
+	return !info.IsDir()
+}
+
+// spawnShellWatchdog starts the /bin/sh sidecar.
+func (s *Supervisor) spawnShellWatchdog(spec Spec, shell string) (*watchdog, error) {
 	r, w, err := os.Pipe()
 	if err != nil {
-		return nil, nil, fmt.Errorf("procman: watchdog pipe: %v", err)
+		return nil, fmt.Errorf("procman: watchdog pipe: %v", err)
 	}
 
 	graceSec := int(spec.StopGrace / time.Second)
 	if graceSec <= 0 {
 		graceSec = 5
 	}
-	cmd := exec.Command(s.watchdogShell(), "-c", watchdogScript(graceSec))
+	cmd := exec.Command(shell, "-c", watchdogScript(graceSec))
 	cmd.Stdin = nil
 	cmd.Stdout = nil
 	cmd.Stderr = nil
-	// ExtraFiles[0] becomes fd 3 in the child.
-	cmd.ExtraFiles = []*os.File{r}
+	cmd.ExtraFiles = []*os.File{r} // becomes fd 3 in the child
 	// Put the watchdog in its own process group so it is not swept up by the
 	// target's group kill.
 	if cmd.SysProcAttr == nil {
@@ -78,37 +103,74 @@ func (s *Supervisor) spawnWatchdog(spec Spec) (*exec.Cmd, *os.File, error) {
 	if err := cmd.Start(); err != nil {
 		_ = r.Close()
 		_ = w.Close()
-		return nil, nil, fmt.Errorf("procman: watchdog start: %v", err)
+		return nil, fmt.Errorf("procman: watchdog start: %v", err)
 	}
-	// The parent does not need the read end; close it so the only read end is
-	// in the watchdog. When the parent dies, the write end closes and the
-	// watchdog sees EOF.
+	_ = r.Close() // the only read end is now in the watchdog
+	wd := &watchdog{proc: cmd.Process, pipe: w, done: make(chan struct{})}
+	go func() {
+		_, _ = cmd.Process.Wait()
+		close(wd.done)
+	}()
+	return wd, nil
+}
+
+// spawnFallbackWatchdog starts the re-executed host-binary fallback when no
+// shell is available.
+func (s *Supervisor) spawnFallbackWatchdog(spec Spec) (*watchdog, error) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		return nil, fmt.Errorf("procman: fallback watchdog pipe: %v", err)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		_ = r.Close()
+		_ = w.Close()
+		return nil, fmt.Errorf("procman: fallback watchdog exe: %v", err)
+	}
+	proc, err := os.StartProcess(exe, []string{exe}, &os.ProcAttr{
+		Env:   append(os.Environ(), watchdogFallbackEnv+"=1"),
+		Files: []*os.File{nil, nil, nil, r}, // fd 3 is the read end
+		Sys:   fallbackSysProcAttr(),
+	})
+	if err != nil {
+		_ = r.Close()
+		_ = w.Close()
+		return nil, fmt.Errorf("procman: fallback watchdog start: %v", err)
+	}
 	_ = r.Close()
-	return cmd, w, nil
+	wd := &watchdog{proc: proc, pipe: w, done: make(chan struct{})}
+	go func() {
+		_, _ = proc.Wait()
+		close(wd.done)
+	}()
+	return wd, nil
 }
 
 // armWatchdog writes the target's pgid to the sentinel pipe, arming the
 // watchdog. After this, EOF on the pipe (parent death) triggers the kill
 // sequence. The pgid is validated as a positive integer before writing.
-func armWatchdog(w *os.File, pgid int) error {
+func armWatchdog(wd *watchdog, pgid int) error {
+	if wd == nil || wd.pipe == nil {
+		return nil
+	}
 	if pgid <= 0 {
 		return fmt.Errorf("procman: invalid pgid %d", pgid)
 	}
 	line := strconv.Itoa(pgid) + "\n"
-	if _, err := w.WriteString(line); err != nil {
+	if _, err := wd.pipe.WriteString(line); err != nil {
 		return fmt.Errorf("procman: arm watchdog: %v", err)
 	}
 	return nil
 }
 
 // standDownWatchdog writes the stand-down line so the watchdog exits cleanly
-// without killing the group, then closes the pipe.
-func standDownWatchdog(w *os.File) {
-	if w == nil {
+// without killing the group, then closes the pipe. Idempotent.
+func standDownWatchdog(wd *watchdog) {
+	if wd == nil || wd.pipe == nil {
 		return
 	}
-	_, _ = w.WriteString("done\n")
-	_ = w.Close()
+	_, _ = wd.pipe.WriteString("done\n")
+	_ = wd.pipe.Close()
 }
 
 // watchdogEnabled reports whether the watchdog sidecar is active for this

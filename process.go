@@ -39,8 +39,7 @@ type Process struct {
 
 	// wd is the Unix sidecar watchdog, if one was spawned for this
 	// generation. nil on Windows or when Watchdog is off.
-	wdCmd  *exec.Cmd
-	wdPipe *os.File
+	wd *watchdog
 }
 
 // Name returns the Spec.Name.
@@ -127,13 +126,12 @@ func (p *Process) startGeneration(ctx context.Context) (*exec.Cmd, error) {
 
 	// Spawn ordering: watchdog FIRST (before the target), so a parent death
 	// at any point after this has a watcher that knows nothing to kill yet.
-	wdCmd, wdPipe, err := p.sup.spawnWatchdog(p.spec)
+	wd, err := p.sup.spawnWatchdog(p.spec)
 	if err != nil {
 		return nil, err
 	}
 	p.mu.Lock()
-	p.wdCmd = wdCmd
-	p.wdPipe = wdPipe
+	p.wd = wd
 	p.mu.Unlock()
 
 	p.mu.Lock()
@@ -147,10 +145,9 @@ func (p *Process) startGeneration(ctx context.Context) (*exec.Cmd, error) {
 		// Target never started: stand the watchdog down (it reads EOF or the
 		// stand-down line and exits 0). Close the pipe so the watchdog does
 		// not linger.
-		standDownWatchdog(wdPipe)
+		standDownWatchdog(wd)
 		p.mu.Lock()
-		p.wdCmd = nil
-		p.wdPipe = nil
+		p.wd = nil
 		p.mu.Unlock()
 		return nil, err
 	}
@@ -161,13 +158,13 @@ func (p *Process) startGeneration(ctx context.Context) (*exec.Cmd, error) {
 	// target Start and this write — the minimum possible since the pgid does
 	// not exist until the target does.
 	pgid := cmd.Process.Pid
-	if wdPipe != nil {
-		if armErr := armWatchdog(wdPipe, pgid); armErr != nil {
+	if wd != nil {
+		if armErr := armWatchdog(wd, pgid); armErr != nil {
 			// Arming failed: kill the target we just started and fail Start,
 			// rather than proceeding with an unarmed watchdog.
 			_ = signalKillGroup(cmd.Process, pgid)
 			_, _ = cmd.Process.Wait()
-			standDownWatchdog(wdPipe)
+			standDownWatchdog(wd)
 			return nil, armErr
 		}
 	}
@@ -182,10 +179,9 @@ func (p *Process) startGeneration(ctx context.Context) (*exec.Cmd, error) {
 		// rather than proceeding without the parent-death guarantee.
 		_ = cmd.Process.Kill()
 		_, _ = cmd.Process.Wait()
-		standDownWatchdog(wdPipe)
+		standDownWatchdog(wd)
 		p.mu.Lock()
-		p.wdCmd = nil
-		p.wdPipe = nil
+		p.wd = nil
 		p.mu.Unlock()
 		return nil, err
 	}
@@ -218,14 +214,12 @@ func (p *Process) reap(cmd *exec.Cmd) {
 	// line and exits 0 without killing the group. Reap its exit so it does
 	// not become a zombie.
 	p.mu.Lock()
-	wd := p.wdCmd
-	wdPipe := p.wdPipe
-	p.wdCmd = nil
-	p.wdPipe = nil
+	wd := p.wd
+	p.wd = nil
 	p.mu.Unlock()
-	standDownWatchdog(wdPipe)
+	standDownWatchdog(wd)
 	if wd != nil {
-		_, _ = wd.Process.Wait()
+		<-wd.done
 	}
 
 	// Release the platform group/container handle (Job Object on Windows).

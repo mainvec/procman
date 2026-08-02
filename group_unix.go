@@ -70,6 +70,13 @@ func assignToGroupHandle(cmd *exec.Cmd) (groupHandle, error) {
 	return nil, nil
 }
 
+// fallbackSysProcAttr returns the SysProcAttr for the re-executed fallback
+// watchdog: its own process group, so the target's group kill does not sweep
+// it up.
+func fallbackSysProcAttr() *syscall.SysProcAttr {
+	return newGroupAttrs()
+}
+
 // signalTermGroup sends SIGTERM to the whole process group. On Unix the child
 // is its own group leader (Setpgid), so pgid == pid; kill(-pgid, SIGTERM)
 // reaches it and all descendants.

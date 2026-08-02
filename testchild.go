@@ -1,6 +1,7 @@
 package procman
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -66,6 +67,25 @@ func TryRunTestChild() bool {
 		return false
 	}
 	runTestChild()
+	return true
+}
+
+// testParentEnv triggers the "parent" mode of the test binary: it starts a
+// supervised child that spawns grandchildren, prints "PARENT_READY" and the
+// grandchild PIDs to stdout, then blocks forever waiting to be killed. The
+// main test SIGKILLs this parent to verify the watchdog/Job Object kills the
+// whole tree.
+const testParentEnv = "PROCMAN_TEST_PARENT"
+
+// TryRunTestParent runs the "parent" behaviour when the binary is re-executed
+// with PROCMAN_TEST_PARENT=1. It returns true if it handled the invocation
+// (and never returns, since the process blocks). It is the out-of-process
+// parent the T10 verification needs.
+func TryRunTestParent() bool {
+	if os.Getenv(testParentEnv) == "" {
+		return false
+	}
+	runTestParent()
 	return true
 }
 
@@ -184,4 +204,65 @@ func TestChildArgs(exitCode int, delay time.Duration, extra ...string) []string 
 // harness, to be appended to the child's environment.
 func TestChildEnv() []string {
 	return []string{testChildEnv + "=1"}
+}
+
+// TestParentEnv returns the environment entry needed to activate the
+// out-of-process parent mode used by the T10 parent-death verification.
+func TestParentEnv() []string {
+	return []string{testParentEnv + "=1"}
+}
+
+// runTestParent is the out-of-process parent used by T10 verification. It
+// starts a Supervisor (WatchdogAuto) with a single child that spawns
+// grandchildren, prints "PARENT_READY" plus the grandchild PIDs to stdout,
+// then blocks forever. The main test SIGKILLs this process and asserts the
+// grandchildren are gone within the grace period. It never returns.
+func runTestParent() {
+	exe, err := os.Executable()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "testparent: exe lookup failed:", err)
+		os.Exit(1)
+	}
+	// Read flags: stop-grace (seconds) and a "fallback" bool to force the
+	// re-exec watchdog by pointing ShellPath at a nonexistent file.
+	fs := flag.NewFlagSet("procman-testparent", flag.ExitOnError)
+	graceSec := fs.Int("stop-grace", 1, "stop grace seconds")
+	fallback := fs.Bool("fallback", false, "force the re-exec watchdog fallback")
+	fs.Parse(os.Args[1:])
+
+	opts := Options{Watchdog: WatchdogAuto}
+	if *fallback {
+		opts.ShellPath = "/nonexistent/shell/for/fallback"
+	}
+	s := New(opts)
+
+	pidsCh := make(chan string, 16)
+	p, err := s.Start(context.Background(), Spec{
+		Name:      "tree",
+		Path:      exe,
+		Args:      TestChildArgs(0, 300*time.Second, "-grandchild=2"),
+		Env:       TestChildEnv(),
+		StopGrace: time.Duration(*graceSec) * time.Second,
+		OnLine: func(l Line) {
+			if strings.HasPrefix(l.Text, "grandchild-") && strings.Contains(l.Text, "pid=") {
+				pidsCh <- l.Text
+			}
+		},
+	})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "testparent: Start failed:", err)
+		os.Exit(1)
+	}
+	_ = p
+
+	// Announce readiness and the grandchild PIDs as they arrive.
+	fmt.Println("PARENT_READY")
+	for i := 0; i < 2; i++ {
+		fmt.Println(<-pidsCh)
+	}
+	os.Stdout.Sync()
+
+	// Block forever; the main test will SIGKILL us. The watchdog (or Job
+	// Object) is what should kill the grandchildren after our death.
+	select {}
 }
