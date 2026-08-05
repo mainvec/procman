@@ -182,6 +182,23 @@ returned. `ExitCode` then matches `os.ProcessState.ExitCode`. Before reaping it
 returns `-1`. On Unix, `-1` also represents termination by a signal; Windows
 reports the termination status supplied by the operating system.
 
+`StopRequested` separates a shutdown from a crash. It is true once `Stop` or
+`KillAll` requests termination while a command is observed running, and stays
+true after exit, so a supervisor can tell an exit it asked for from one it did
+not:
+
+```go
+<-cmd.Done()
+if !cmd.StopRequested() {
+	log.Printf("worker died on its own with status %d", cmd.ExitCode())
+}
+```
+
+It records intent, not proof that the operating system delivered a signal. It
+is false for termination requested outside this `Procman`, and false when the
+command had already exited before `Stop` was called — tidying up after something
+already dead is not the same as having stopped it.
+
 Available state methods:
 
 - `ID()` returns the command's procman identifier.
@@ -191,6 +208,10 @@ Available state methods:
 - `IsExited()` reports a successful or unsuccessful exit.
 - `Done()` returns a channel closed after the process is reaped.
 - `ExitCode()` returns the platform process exit status, or `-1` before reaping.
+- `StopRequested()` reports whether this `Procman` asked the command to stop.
+- `StartedAt()` returns when the command started, or the zero time before that.
+- `ExitedAt()` returns when reaping and platform cleanup completed, or the zero
+	time before that.
 - `GetProcessState()` exposes `*os.ProcessState` after the process is reaped.
 
 ## Stopping processes

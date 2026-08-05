@@ -9,6 +9,8 @@
 - [x] T1: Export `ExecCmd.Done()` and `ExecCmd.ExitCode()`
 - [x] T2: Per-command `WithOnStart` / `WithOnExit` hooks
 - [x] T3: Document which delivery path is for which purpose
+- [x] T4: Report whether an exit was asked for
+- [x] T5: Report when the command started and exited
 
 ## Problem / Goal
 
@@ -27,8 +29,8 @@ unusable for anything that must not be missed.
 command that already has one, distinguishable from the reaper only by who wins.
 
 **Exit status has to be re-derived.** `GetProcessState()` exposes `*os.ProcessState`, so every
-consumer writes the same `if state != nil { state.ExitCode() }` dance and the same "-1 means
-signal" convention that the reaper already dealt with.
+consumer writes the same `if state != nil { state.ExitCode() }` dance and has to account for its
+platform-specific termination status.
 
 The result is visible in the first consumer. `zirafa-core/core.ProcessManager` runs a `reap`
 goroutine per process that calls `ecmd.Wait()`, reads `GetProcessState().ExitCode()`, and closes
@@ -73,9 +75,9 @@ starting a goroutine of its own and without an event it might not receive.
 reaper already closes it last, after `status` and `waitErr` are written and after the manager-wide
 notify, so a reader that wakes on it sees settled state.
 
-`ExitCode()` reports the status the reaper obtained, and -1 for a command killed by a signal or one
-that has not exited. The `-1` convention is `os.ProcessState.ExitCode()`'s own, so this adds no new
-vocabulary.
+`ExitCode()` reports the status the reaper obtained, and -1 for one that has not exited. It returns
+`os.ProcessState.ExitCode()` unchanged: Unix also uses -1 for a command killed by a signal, while
+Windows reports the termination status supplied to the operating system.
 
 ### Per-command hooks
 
@@ -106,16 +108,19 @@ between a direct call and a queued one would be a promise about scheduling.
 
 ## Affected Modules
 
-- `procman.go` — `execCmdOptions` gains two function fields; `ExecCmd` gains `Done`, `ExitCode` and
-  the option plumbing; `Start` calls the hooks.
-- `doc.go` — the package overview should say which path to use for what.
+- `procman.go` — option plumbing and hooks; `ExecCmd` gains `Done`, `ExitCode`, `StopRequested`,
+  `StartedAt`, and `ExitedAt`.
+- `observable_exit_test.go`, `stop_requested_test.go`, `lifecycle_times_test.go` — portable
+  behavioral and concurrency coverage.
+- `observable_exit_unix_test.go` — Unix signal exit-code semantics.
+- `doc.go` and `README.md` — delivery guarantees, lifecycle metadata, and callback constraints.
 
 ## Tasks
 
 ### T1: Export `ExecCmd.Done()` and `ExecCmd.ExitCode()`
 
 **Outcome**: `Done() <-chan struct{}` returns the channel the reaper closes. `ExitCode() int`
-returns the exit status, -1 for a signal or a command that has not exited.
+returns the platform exit status and -1 before the command has exited.
 
 **Verification**: A test selects on `Done()` for a command that exits on its own and asserts it
 closes; a second asserts `ExitCode()` matches the code the child exited with, and is -1 after the
@@ -128,10 +133,10 @@ rather than adding a second source of truth.
 The tests needed a child that exits with a chosen status, so `procman_test.go` gained a
 `--procman-exit` mode alongside the existing sleep and argv0 modes.
 
-A caller cannot tell "not exited" from "killed by a signal" by the code alone — both are -1. That is
-`os.ProcessState.ExitCode`'s own convention and `Done()` answers the question, so the alternative
-(a second return value, or a sentinel of our own) would have bought ambiguity of a different kind.
-Stated in the doc comment.
+On Unix, a caller cannot tell "not exited" from "killed by a signal" by the code alone — both are
+-1. That is `os.ProcessState.ExitCode`'s own convention and `Done()` answers the question, so the
+alternative (a second return value, or a sentinel of our own) would have bought ambiguity of a
+different kind. Stated in the doc comment.
 
 The -1-for-a-signal assertion is Unix-only and lives in `observable_exit_unix_test.go`; it compiled
 for Windows but would have failed on one. What holds everywhere — that `ExitCode` reports whatever
@@ -193,6 +198,52 @@ The first draft claimed a panicking exit hook leaves the command unreaped. It do
 has already returned by then. The real consequence is worse and now stated — the panic is on the
 reaper goroutine, so it ends the process.
 
+### T4: Report whether an exit was asked for
+
+**Outcome**: `ExecCmd.StopRequested() bool` reports whether `Stop` or `KillAll` requested
+termination while the command was observed running. Sticky, so it still answers after the command
+has gone.
+
+**Verification**: Tests for a command that ended on its own, one that was stopped, one killed
+through `KillAll`, and — the case that matters — one that crashed and was only then stopped. A test
+asserts the flag is readable from the exit hook.
+
+**Notes.** Done. `ExecCmd` already had a transient `stopping` field, cleared once the stop
+completes; this is the durable fact next to it.
+
+The flag is set after `Stop`'s liveness check rather than on entry. Setting it on entry would mark a
+command that had already crashed, and the whole point of the flag is to tell a crash from a
+shutdown. Mutation-tested: moving the assignment above the check fails
+`TestStopRequestedStaysFalseWhenTheCommandWasAlreadyGone` with `StopRequested() is true for a
+command that had already exited`.
+
+`KillAll` bypasses `Stop` and calls `forceKill` directly, so it marks the command itself. This is why
+the flag belongs here rather than in a consumer's wrapper: a consumer cannot see `KillAll`, and
+`Shutdown` reaches processes through `StopAll` without going through anything a consumer wrote.
+
+Deliberately false for a command signalled from outside the `Procman` — a stray `kill(1)` is a crash
+as far as this library is concerned, because it is not something the library asked for.
+
+### T5: Report when the command started and exited
+
+**Outcome**: `ExecCmd.ExitedAt()` and `ExecCmd.StartedAt()`, both zero before the event they name.
+
+**Verification**: Tests that each is zero beforehand, that each falls between the call that should
+have set it and the moment after, that `StartedAt` precedes `ExitedAt`, and that the exit hook can
+read `ExitedAt`.
+
+**Notes.** Done. `ExitedAt` is written in the reaper under `c.mu`, alongside the status it already
+sets, so there is one write and it happens before the exit hook and before `Done` closes.
+`startedAt` was already being recorded and simply had no accessor.
+
+`ExitedAt` is recorded after `exec.Cmd.Wait` and platform cleanup complete, not when the kernel
+ended the process — the doc comment says so, because the difference is invisible from here and a
+caller measuring shutdown latency would otherwise be measuring the reaper's scheduling.
+
+The alternative was leaving it to each consumer, which is what the first consumer was doing: a mutex
+and a hook body on `zirafa-core`'s `ManagedProcess` existing only to timestamp something `procman`
+was already standing over. Both are now gone.
+
 ## Risks and Compatibility
 
 - **Additive only.** New methods and new options; no existing signature or behaviour changes.
@@ -214,9 +265,9 @@ reaper goroutine, so it ends the process.
    channel, with every per-command hook still observed.
 5. Guards mutation-tested.
 
-**Result** (darwin/arm64, 2026-08-05): `gofmt -l .` clean, `go vet ./...` clean,
-`GOOS=linux go build ./...` and `GOOS=windows go build ./...` clean,
-`go test ./... -count=1 -race` ok in 13.0s.
+**Result** (2026-08-05): focused lifecycle metadata tests passed 10 consecutive race-enabled runs;
+the full race suite passed on darwin/arm64 and Linux; `go vet ./...` was clean; and Windows and
+FreeBSD test binaries cross-compiled successfully.
 
 ## Rollout
 
@@ -244,3 +295,12 @@ the same change.
   -1 for a signalled child on Unix; Windows reports the status `TerminateProcess` was given. The
   portable assertion is that `ExitCode` agrees with `GetProcessState().ExitCode`, which is all the
   method promises.
+- **2026-08-05** — `stopRequested` lives on `ExecCmd` rather than in the consumer. A wrapper can
+  only see the stops it issues itself; `KillAll` calls `forceKill` directly and `Shutdown` goes
+  through `StopAll`, so a command can be signalled by this library without the consumer's wrapper
+  ever being told. Only `ExecCmd` sees every path.
+- **2026-08-05** — Capturing child output stays with the consumer. Prefixes, tail limits and log
+  sinks are application policy, and `exec.Cmd.Stdout` is already a caller-supplied `io.Writer`, so
+  there is nothing here the library alone can know. The hazard the library does create — the reaper
+  calling `Wait` and closing `StdoutPipe` under a reader — is documented on `NewExecCmdFromCmd`
+  instead.

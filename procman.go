@@ -230,7 +230,9 @@ type ExecCmd struct {
 	cmd                    *exec.Cmd
 	started                bool
 	stopping               bool
+	stopRequested          bool
 	startedAt              time.Time
+	exitedAt               time.Time
 	status                 ExecCmdStatus
 	waitErr                error
 	doneChan               chan struct{}
@@ -363,6 +365,10 @@ func (p *Procman) NewExecCmd(name string, args []string, opts ...ExecCmdOption) 
 // NewExecCmdFromCmd registers an unstarted caller-supplied command. Procman
 // starts the exact *exec.Cmd without rebuilding it, preserving fields such as
 // Env, Dir, standard streams, and argv[0]. It rejects nil or started commands.
+//
+// Set Stdout and Stderr to writers rather than using StdoutPipe or StderrPipe:
+// the reaper calls Wait as soon as the child exits, which closes those pipes
+// under whatever is reading them.
 func (p *Procman) NewExecCmdFromCmd(cmd *exec.Cmd, opts ...ExecCmdOption) (*ExecCmd, error) {
 	if cmd == nil {
 		return nil, errors.New("cmd cannot be nil")
@@ -441,6 +447,9 @@ func (p *Procman) KillAll() {
 		child.mu.Lock()
 		started := child.started
 		cmd := child.cmd
+		if started && cmd != nil && cmd.Process != nil && child.status == ExecCmdStatusRunning {
+			child.stopRequested = true
+		}
 		child.mu.Unlock()
 		if started && cmd != nil && cmd.Process != nil {
 			_ = forceKill(child)
@@ -573,6 +582,7 @@ func (c *ExecCmd) start() error {
 		} else {
 			c.status = ExecCmdStatusExited
 		}
+		c.exitedAt = time.Now()
 		c.mu.Unlock()
 		c.procman.notifyOnExit(c, err)
 		// Before the close, so that anything waiting on Done sees a command the
@@ -659,6 +669,9 @@ func (c *ExecCmd) Stop() error {
 		c.mu.Unlock()
 		return nil
 	}
+	// Set only once the command is known to be alive, so that stopping something
+	// that has already died is not mistaken for having stopped it.
+	c.stopRequested = true
 	doneChan := c.doneChan
 	if c.stopping {
 		stopDone := c.stopDone
@@ -739,4 +752,32 @@ func (c *ExecCmd) ExitCode() int {
 		return -1
 	}
 	return state.ExitCode()
+}
+
+// StopRequested reports whether Stop or KillAll requested termination while
+// this command was observed running. It stays true once set, so an exited
+// command still says whether it was asked to go — the difference between a
+// shutdown and a crash. It does not prove that the operating system delivered
+// a signal, and it is false for termination requested outside this Procman.
+func (c *ExecCmd) StopRequested() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.stopRequested
+}
+
+// ExitedAt returns the time recorded after the command was reaped and platform
+// cleanup completed, and the zero time before that. It is not the exact moment
+// the kernel ended the process, which nothing here can observe.
+func (c *ExecCmd) ExitedAt() time.Time {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.exitedAt
+}
+
+// StartedAt returns when the command was started, and the zero time before
+// that. With ExitedAt it gives the command's lifetime.
+func (c *ExecCmd) StartedAt() time.Time {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.startedAt
 }
