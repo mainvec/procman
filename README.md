@@ -165,6 +165,40 @@ Multiple goroutines may call `Wait` on the same command. All callers receive
 the same result. Calling `Wait` before `Start` returns
 `procman.ErrExecCmdNotStarted`.
 
+Use `Done` when exit needs to compose with other channel operations without a
+dedicated goroutine:
+
+```go
+select {
+case <-cmd.Done():
+	log.Printf("process exited with status %d", cmd.ExitCode())
+case <-ctx.Done():
+	return ctx.Err()
+}
+```
+
+`Done` closes after the child has been reaped and its per-command exit hook has
+returned. `ExitCode` then matches `os.ProcessState.ExitCode`. Before reaping it
+returns `-1`. On Unix, `-1` also represents termination by a signal; Windows
+reports the termination status supplied by the operating system.
+
+`StopRequested` separates a shutdown from a crash. It is true once `Stop` or
+`KillAll` requests termination while a command is observed running, and stays
+true after exit, so a supervisor can tell an exit it asked for from one it did
+not:
+
+```go
+<-cmd.Done()
+if !cmd.StopRequested() {
+	log.Printf("worker died on its own with status %d", cmd.ExitCode())
+}
+```
+
+It records intent, not proof that the operating system delivered a signal. It
+is false for termination requested outside this `Procman`, and false when the
+command had already exited before `Stop` was called — tidying up after something
+already dead is not the same as having stopped it.
+
 Available state methods:
 
 - `ID()` returns the command's procman identifier.
@@ -172,6 +206,12 @@ Available state methods:
 - `IsStarted()` reports whether `Start` succeeded.
 - `IsRunning()` checks whether the process is still running.
 - `IsExited()` reports a successful or unsuccessful exit.
+- `Done()` returns a channel closed after the process is reaped.
+- `ExitCode()` returns the platform process exit status, or `-1` before reaping.
+- `StopRequested()` reports whether this `Procman` asked the command to stop.
+- `StartedAt()` returns when the command started, or the zero time before that.
+- `ExitedAt()` returns when reaping and platform cleanup completed, or the zero
+	time before that.
 - `GetProcessState()` exposes `*os.ProcessState` after the process is reaped.
 
 ## Stopping processes
@@ -221,6 +261,9 @@ and start attempts after shutdown return `procman.ErrProcmanShutdown`.
 
 ## Lifecycle callbacks
 
+Procman-wide callbacks are asynchronous observability hooks suitable for logs,
+metrics, and dashboards:
+
 Callbacks are dispatched asynchronously so process supervision is not blocked:
 
 ```go
@@ -237,6 +280,28 @@ Set callbacks before starting commands. Events are processed serially through a
 buffered queue; events may be dropped if the queue is full. Use
 `WaitEventLoop()` when shutdown or tests must wait for queued callbacks to
 finish. Callbacks should return promptly.
+
+Use command options when delivery must not be dropped:
+
+```go
+cmd, err := pm.NewExecCmd(
+	"worker",
+	procman.Args("--queue", "emails"),
+	procman.WithOnStart(func(cmd *procman.ExecCmd) {
+		log.Printf("started pid %d", cmd.Pid())
+	}),
+	procman.WithOnExit(func(cmd *procman.ExecCmd, err error) {
+		log.Printf("exited with status %d: %v", cmd.ExitCode(), err)
+	}),
+)
+```
+
+`WithOnStart` runs synchronously before `Start` returns, after the reaper is
+running and without a Procman lock held. `WithOnExit` runs on the reaper
+goroutine after exit state is recorded and before `Done` closes. It must return
+promptly: blocking delays that command's `Done`, `Wait`, and `Shutdown`, and it
+must not call `Wait` or `Shutdown` itself because both wait for the hook to
+return. A panic in an exit hook terminates the application.
 
 ## Registry
 

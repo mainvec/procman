@@ -18,6 +18,7 @@ import (
 const (
 	testSleepMode      = "--procman-sleep"
 	testPrintArgv0Mode = "--procman-print-argv0"
+	testExitMode       = "--procman-exit"
 )
 
 func init() {
@@ -33,6 +34,12 @@ func init() {
 		}
 		time.Sleep(time.Duration(seconds) * time.Second)
 		os.Exit(0)
+	case testExitMode:
+		code, err := strconv.Atoi(os.Args[2])
+		if err != nil {
+			os.Exit(2)
+		}
+		os.Exit(code)
 	case testPrintArgv0Mode:
 		_, _ = os.Stdout.WriteString(os.Args[0])
 		os.Exit(0)
@@ -46,6 +53,15 @@ func testSleepCommand(t *testing.T, seconds int) (string, []string) {
 		t.Fatalf("os.Executable: %v", err)
 	}
 	return self, []string{testSleepMode, strconv.Itoa(seconds)}
+}
+
+func testExitCommand(t *testing.T, code int) (string, []string) {
+	t.Helper()
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	return self, []string{testExitMode, strconv.Itoa(code)}
 }
 
 func testArgv0Command(t *testing.T, stdout *bytes.Buffer) (*exec.Cmd, string) {
