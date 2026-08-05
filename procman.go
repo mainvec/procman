@@ -31,6 +31,8 @@ type execCmdOptions struct {
 	gracePeriod            time.Duration
 	processTreeTermination bool
 	parentDeathCleanup     bool
+	onStart                func(*ExecCmd)
+	onExit                 func(*ExecCmd, error)
 	// future fields: Env, Dir, Stdout, Stderr, etc.
 }
 
@@ -117,6 +119,32 @@ func WithParentDeathCleanupIfSupported() ExecCmdOption {
 	}
 }
 
+// WithOnStart registers a callback run once the command is running, from the
+// goroutine that called Start, after the reaper has been started and with no
+// manager lock held. Unlike Procman.OnStart it is never dropped, and it delays
+// Start's return until it completes.
+func WithOnStart(fn func(*ExecCmd)) ExecCmdOption {
+	return func(o *execCmdOptions) error {
+		o.onStart = fn
+		return nil
+	}
+}
+
+// WithOnExit registers a callback run once the command has exited and been
+// reaped, from that command's own reaper goroutine, with the error returned by
+// exec.Cmd.Wait. Unlike Procman.OnExit it is never dropped: it is called
+// directly rather than queued, and the command's Done channel is not closed
+// until it returns. A callback that blocks therefore delays Done, Wait and
+// Shutdown for that one command, and one that panics ends the process: it runs
+// on the reaper goroutine, where no caller can recover for it. The callback
+// must not call Wait or Shutdown, because both wait for the callback to return.
+func WithOnExit(fn func(*ExecCmd, error)) ExecCmdOption {
+	return func(o *execCmdOptions) error {
+		o.onExit = fn
+		return nil
+	}
+}
+
 // ExecCmdStatus describes the lifecycle state of an ExecCmd.
 type ExecCmdStatus int
 
@@ -148,10 +176,14 @@ type Procman struct {
 	execCmds              map[ID]*ExecCmd
 	defaultExecCmdOptions execCmdOptions
 	// OnStart is called asynchronously after a child starts successfully.
-	// Set it before starting commands and keep the callback non-blocking.
+	// Set it before starting commands and keep the callback non-blocking. It is
+	// dropped when the event loop falls behind; use WithOnStart where every
+	// start must be seen.
 	OnStart func(*ExecCmd)
 	// OnExit is called asynchronously after a child exits and is reaped. Its
-	// error is the result of exec.Cmd.Wait. Set it before starting commands.
+	// error is the result of exec.Cmd.Wait. Set it before starting commands. It
+	// is dropped when the event loop falls behind; use WithOnExit where every
+	// exit must be seen.
 	OnExit func(*ExecCmd, error)
 
 	evtCh        chan event
@@ -208,7 +240,11 @@ type ExecCmd struct {
 	gracePeriod            time.Duration
 	processTreeTermination bool
 	parentDeathCleanup     bool
-	platform               platformState
+	// onStart and onExit are read without holding mu: both are fixed at
+	// construction and never reassigned.
+	onStart  func(*ExecCmd)
+	onExit   func(*ExecCmd, error)
+	platform platformState
 }
 
 // NewProcman creates a running Procman with default command behavior.
@@ -354,6 +390,8 @@ func (p *Procman) NewExecCmdFromCmd(cmd *exec.Cmd, opts ...ExecCmdOption) (*Exec
 		processTreeTermination: o.processTreeTermination,
 		parentDeathCleanup:     o.parentDeathCleanup,
 		gracePeriod:            o.gracePeriod,
+		onStart:                o.onStart,
+		onExit:                 o.onExit,
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -471,6 +509,18 @@ func (c *ExecCmd) ID() ID {
 // started only once. Start returns ErrProcmanShutdown after manager shutdown
 // and ErrExecCmdAlreadyStarted after a prior successful start.
 func (c *ExecCmd) Start() error {
+	if err := c.start(); err != nil {
+		return err
+	}
+	// Outside start so that the hook runs with no manager lock held and with the
+	// reaper already going: it may call back into Procman or into Wait.
+	if c.onStart != nil {
+		c.onStart(c)
+	}
+	return nil
+}
+
+func (c *ExecCmd) start() error {
 	c.procman.mu.RLock()
 	defer c.procman.mu.RUnlock()
 	if c.procman.status == ProcmanStatusShutdown {
@@ -525,6 +575,11 @@ func (c *ExecCmd) Start() error {
 		}
 		c.mu.Unlock()
 		c.procman.notifyOnExit(c, err)
+		// Before the close, so that anything waiting on Done sees a command the
+		// hook has already finished with.
+		if c.onExit != nil {
+			c.onExit(c, err)
+		}
 		close(c.doneChan)
 	}()
 	return nil
@@ -665,4 +720,23 @@ func (c *ExecCmd) GetProcessState() *os.ProcessState {
 		return nil
 	}
 	return c.cmd.ProcessState
+}
+
+// Done returns a channel closed once the command has exited and been reaped.
+// Everything ExecCmd reports about the exit is settled before the close, so a
+// receive is a safe point to read ExitCode or GetProcessState. It is safe to
+// call before Start; the channel simply stays open.
+func (c *ExecCmd) Done() <-chan struct{} {
+	return c.doneChan
+}
+
+// ExitCode returns the platform exit status reported by os.ProcessState. It
+// returns -1 before the command has been reaped. On Unix, -1 also represents a
+// command killed by a signal; use Done to distinguish that from a pending exit.
+func (c *ExecCmd) ExitCode() int {
+	state := c.GetProcessState()
+	if state == nil {
+		return -1
+	}
+	return state.ExitCode()
 }
