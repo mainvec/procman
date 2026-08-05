@@ -18,7 +18,7 @@ func TestProcmanDefaultExecCmdOptions(t *testing.T) {
 		t.Fatalf("NewProcmanWithOptions: %v", err)
 	}
 
-	cmd, err := pm.NewExecCmd("true", nil)
+	cmd, err := pm.NewExecCmd("test-command", nil)
 	if err != nil {
 		t.Fatalf("NewExecCmd: %v", err)
 	}
@@ -42,7 +42,7 @@ func TestExecCmdOptionsOverrideProcmanDefaults(t *testing.T) {
 		t.Fatalf("NewProcmanWithOptions: %v", err)
 	}
 
-	cmd, err := pm.NewExecCmd("true", nil, WithGracePeriod(time.Second))
+	cmd, err := pm.NewExecCmd("test-command", nil, WithGracePeriod(time.Second))
 	if err != nil {
 		t.Fatalf("NewExecCmd: %v", err)
 	}

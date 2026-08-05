@@ -3,7 +3,10 @@ package procman_test
 import (
 	"bytes"
 	"errors"
+	"os"
 	"os/exec"
+	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,23 +15,70 @@ import (
 	procman "github.com/mainvec/procman"
 )
 
+const (
+	testSleepMode      = "--procman-sleep"
+	testPrintArgv0Mode = "--procman-print-argv0"
+)
+
+func init() {
+	if len(os.Args) < 2 {
+		return
+	}
+
+	switch os.Args[1] {
+	case testSleepMode:
+		seconds, err := strconv.Atoi(os.Args[2])
+		if err != nil {
+			os.Exit(2)
+		}
+		time.Sleep(time.Duration(seconds) * time.Second)
+		os.Exit(0)
+	case testPrintArgv0Mode:
+		_, _ = os.Stdout.WriteString(os.Args[0])
+		os.Exit(0)
+	}
+}
+
+func testSleepCommand(t *testing.T, seconds int) (string, []string) {
+	t.Helper()
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	return self, []string{testSleepMode, strconv.Itoa(seconds)}
+}
+
+func testArgv0Command(t *testing.T, stdout *bytes.Buffer) (*exec.Cmd, string) {
+	t.Helper()
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	cmd := exec.Command(self, testPrintArgv0Mode)
+	const argv0 = "custom-argv0"
+	cmd.Args[0] = argv0
+	cmd.Stdout = stdout
+	return cmd, argv0
+}
+
 func TestNewProcman(t *testing.T) {
 	pm := procman.NewProcman()
 	if pm == nil {
 		t.Fatal("expected a procmac instance")
 	}
-	ecmd, err := pm.NewExecCmd("sleep", procman.Args("1"))
+	name, args := testSleepCommand(t, 1)
+	ecmd, err := pm.NewExecCmd(name, args)
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
 	if ecmd == nil {
 		t.Fatal("expected a ExecCmd instance")
 	}
-	if ecmd.Name != "sleep" {
-		t.Fatalf("expected Name to be 'sleep', got: %s", ecmd.Name)
+	if ecmd.Name != name {
+		t.Fatalf("expected Name to be %q, got: %s", name, ecmd.Name)
 	}
-	if len(ecmd.Args) != 1 || ecmd.Args[0] != "1" {
-		t.Fatalf("expected Args to be ['1'], got: %v", ecmd.Args)
+	if !slices.Equal(ecmd.Args, args) {
+		t.Fatalf("expected Args to be %v, got: %v", args, ecmd.Args)
 	}
 
 	err = ecmd.Start()
@@ -75,11 +125,13 @@ func TestMultipleExecCmds(t *testing.T) {
 	if pm == nil {
 		t.Fatal("expected a procmac instance")
 	}
-	ecmd1, err := pm.NewExecCmd("sleep", procman.Args("1"))
+	name1, args1 := testSleepCommand(t, 1)
+	ecmd1, err := pm.NewExecCmd(name1, args1)
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
-	ecmd2, err := pm.NewExecCmd("sleep", procman.Args("2"))
+	name2, args2 := testSleepCommand(t, 2)
+	ecmd2, err := pm.NewExecCmd(name2, args2)
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
@@ -127,7 +179,8 @@ func TestStop(t *testing.T) {
 	}
 
 	// Start a long-running process with a 5s grace period.
-	ecmd, err := pm.NewExecCmd("sleep", procman.Args("60"),
+	name, args := testSleepCommand(t, 60)
+	ecmd, err := pm.NewExecCmd(name, args,
 		procman.WithGracePeriod(5*time.Second))
 	if err != nil {
 		t.Fatalf("NewExecCmd: %v", err)
@@ -170,7 +223,8 @@ func TestStopAll(t *testing.T) {
 	pm := procman.NewProcman()
 	cmds := make([]*procman.ExecCmd, 0, 2)
 	for range 2 {
-		cmd, err := pm.NewExecCmd("sleep", procman.Args("60"),
+		name, args := testSleepCommand(t, 60)
+		cmd, err := pm.NewExecCmd(name, args,
 			procman.WithGracePeriod(100*time.Millisecond))
 		if err != nil {
 			t.Fatalf("NewExecCmd: %v", err)
@@ -208,7 +262,8 @@ func TestStopAll(t *testing.T) {
 
 func TestStopAllIgnoresUnstartedCommands(t *testing.T) {
 	pm := procman.NewProcman()
-	if _, err := pm.NewExecCmd("sleep", procman.Args("60")); err != nil {
+	name, args := testSleepCommand(t, 60)
+	if _, err := pm.NewExecCmd(name, args); err != nil {
 		t.Fatalf("NewExecCmd: %v", err)
 	}
 	if err := pm.StopAll(); err != nil {
@@ -223,7 +278,8 @@ func TestShutdownStopsProcessesAndRejectsNewCommands(t *testing.T) {
 		onExitCounter.Add(1)
 	}
 
-	cmd, err := pm.NewExecCmd("sleep", procman.Args("60"),
+	name, args := testSleepCommand(t, 60)
+	cmd, err := pm.NewExecCmd(name, args,
 		procman.WithGracePeriod(100*time.Millisecond))
 	if err != nil {
 		t.Fatalf("NewExecCmd: %v", err)
@@ -241,7 +297,7 @@ func TestShutdownStopsProcessesAndRejectsNewCommands(t *testing.T) {
 	if got := onExitCounter.Load(); got != 1 {
 		t.Fatalf("expected Shutdown to drain exit callback, got %d callbacks", got)
 	}
-	if _, err := pm.NewExecCmd("true", nil); !errors.Is(err, procman.ErrProcmanShutdown) {
+	if _, err := pm.NewExecCmd(name, args); !errors.Is(err, procman.ErrProcmanShutdown) {
 		t.Fatalf("expected ErrProcmanShutdown after Shutdown, got %v", err)
 	}
 	if err := pm.Shutdown(); err != nil {
@@ -251,7 +307,8 @@ func TestShutdownStopsProcessesAndRejectsNewCommands(t *testing.T) {
 
 func TestShutdownPreventsExistingCommandStart(t *testing.T) {
 	pm := procman.NewProcman()
-	cmd, err := pm.NewExecCmd("sleep", procman.Args("60"))
+	name, args := testSleepCommand(t, 60)
+	cmd, err := pm.NewExecCmd(name, args)
 	if err != nil {
 		t.Fatalf("NewExecCmd: %v", err)
 	}
@@ -282,9 +339,7 @@ func TestShutdownIsConcurrentAndIdempotent(t *testing.T) {
 func TestNewExecCmdFromCmdPreservesArgv0(t *testing.T) {
 	pm := procman.NewProcman()
 	var stdout bytes.Buffer
-	cmd := exec.Command("/bin/sh", "-c", `printf %s "$0"`)
-	cmd.Args[0] = "custom-argv0"
-	cmd.Stdout = &stdout
+	cmd, expectedArgv0 := testArgv0Command(t, &stdout)
 
 	ecmd, err := pm.NewExecCmdFromCmd(cmd)
 	if err != nil {
@@ -296,22 +351,23 @@ func TestNewExecCmdFromCmdPreservesArgv0(t *testing.T) {
 	if err := ecmd.Wait(); err != nil {
 		t.Fatalf("Wait: %v", err)
 	}
-	if got := stdout.String(); got != "custom-argv0" {
+	if got := stdout.String(); got != expectedArgv0 {
 		t.Fatalf("expected argv[0] to be preserved, got %q", got)
 	}
 }
 
 func TestProcessLifecycleOptions(t *testing.T) {
 	pm := procman.NewProcman()
+	name, args := testSleepCommand(t, 1)
 	opts := []procman.ExecCmdOption{procman.WithProcessTreeTermination()}
-	if _, err := pm.NewExecCmd("true", nil, opts...); err != nil {
+	if _, err := pm.NewExecCmd(name, args, opts...); err != nil {
 		t.Fatalf("WithProcessTreeTermination: %v", err)
 	}
-	if _, err := pm.NewExecCmd("true", nil,
+	if _, err := pm.NewExecCmd(name, args,
 		procman.WithParentDeathCleanupIfSupported()); err != nil {
 		t.Fatalf("WithParentDeathCleanupIfSupported: %v", err)
 	}
-	_, err := pm.NewExecCmd("true", nil, procman.WithParentDeathCleanup())
+	_, err := pm.NewExecCmd(name, args, procman.WithParentDeathCleanup())
 	if procman.SupportsParentDeathCleanup() && err != nil {
 		t.Fatalf("WithParentDeathCleanup on supported platform: %v", err)
 	}

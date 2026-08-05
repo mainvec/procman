@@ -1,10 +1,8 @@
 //go:build windows
 
-// These tests verify procman functionality on Windows using the test binary
-// itself as a portable sleep command (--procman-sleep N), since Windows does
-// not ship with a "sleep" or "true" executable. The parent-death test spawns
-// a child process of the test binary, starts managed grandchildren with
-// WithParentDeathCleanup, kills the parent, and verifies that the kernel
+// These tests verify Windows-specific parent-death cleanup. The parent-death
+// test spawns a child process of the test binary, starts managed grandchildren
+// with WithParentDeathCleanup, kills the parent, and verifies that the kernel
 // terminates the grandchildren via the kill-on-close Job Object.
 
 package procman_test
@@ -15,8 +13,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -24,134 +20,6 @@ import (
 
 	procman "github.com/mainvec/procman"
 )
-
-// sleepName returns the test binary path and arguments that sleep for the
-// given number of seconds. The test binary handles --procman-sleep in init().
-func sleepName(secs int) (string, []string) {
-	self, _ := os.Executable()
-	return self, []string{"--procman-sleep", strconv.Itoa(secs)}
-}
-
-// init handles the --procman-sleep mode so the test binary can act as a
-// portable sleep command on Windows.
-func init() {
-	if len(os.Args) > 2 && os.Args[1] == "--procman-sleep" {
-		secs, _ := strconv.Atoi(os.Args[2])
-		if secs == 0 {
-			secs = 60
-		}
-		time.Sleep(time.Duration(secs) * time.Second)
-		os.Exit(0)
-	}
-}
-
-// TestWindowsNewProcman tests basic start and wait on Windows.
-func TestWindowsNewProcman(t *testing.T) {
-	pm := procman.NewProcman()
-	name, args := sleepName(1)
-	cmd, err := pm.NewExecCmd(name, args)
-	if err != nil {
-		t.Fatalf("NewExecCmd: %v", err)
-	}
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	if err := cmd.Wait(); err != nil {
-		t.Fatalf("Wait: %v", err)
-	}
-	if !cmd.IsExited() {
-		t.Fatal("expected IsExited=true")
-	}
-}
-
-// TestWindowsMultipleExecCmds tests multiple concurrent commands with
-// OnStart and OnExit callbacks.
-func TestWindowsMultipleExecCmds(t *testing.T) {
-	pm := procman.NewProcman()
-	var onStart, onExit atomic.Int32
-	pm.OnStart = func(cmd *procman.ExecCmd) { onStart.Add(1) }
-	pm.OnExit = func(cmd *procman.ExecCmd, err error) { onExit.Add(1) }
-
-	n1, a1 := sleepName(1)
-	n2, a2 := sleepName(2)
-	c1, _ := pm.NewExecCmd(n1, a1)
-	c2, _ := pm.NewExecCmd(n2, a2)
-	c1.Start()
-	c2.Start()
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); c1.Wait() }()
-	go func() { defer wg.Done(); c2.Wait() }()
-	wg.Wait()
-
-	pm.WaitEventLoop()
-	if onStart.Load() != 2 {
-		t.Fatalf("expected 2 OnStart, got %d", onStart.Load())
-	}
-	if onExit.Load() != 2 {
-		t.Fatalf("expected 2 OnExit, got %d", onExit.Load())
-	}
-}
-
-// TestWindowsStop tests graceful stop with a grace period.
-func TestWindowsStop(t *testing.T) {
-	pm := procman.NewProcman()
-	var onExit atomic.Int32
-	pm.OnExit = func(cmd *procman.ExecCmd, err error) { onExit.Add(1) }
-
-	name, args := sleepName(60)
-	cmd, _ := pm.NewExecCmd(name, args, procman.WithGracePeriod(5*time.Second))
-	cmd.Start()
-	time.Sleep(200 * time.Millisecond)
-	if !cmd.IsRunning() {
-		t.Fatal("expected running")
-	}
-	if err := cmd.Stop(); err != nil {
-		t.Fatalf("Stop: %v", err)
-	}
-	if !cmd.IsExited() {
-		t.Fatal("expected exited")
-	}
-	pm.WaitEventLoop()
-	if onExit.Load() != 1 {
-		t.Fatalf("expected 1 OnExit, got %d", onExit.Load())
-	}
-}
-
-// TestWindowsStopAll tests concurrent stop of multiple commands.
-func TestWindowsStopAll(t *testing.T) {
-	pm := procman.NewProcman()
-	for range 2 {
-		name, args := sleepName(60)
-		cmd, _ := pm.NewExecCmd(name, args, procman.WithGracePeriod(100*time.Millisecond))
-		cmd.Start()
-	}
-	if err := pm.StopAll(); err != nil {
-		t.Fatalf("StopAll: %v", err)
-	}
-}
-
-// TestWindowsShutdown tests that Shutdown stops processes, drains callbacks,
-// and rejects new commands.
-func TestWindowsShutdown(t *testing.T) {
-	pm := procman.NewProcman()
-	var onExit atomic.Int32
-	pm.OnExit = func(cmd *procman.ExecCmd, err error) { onExit.Add(1) }
-
-	name, args := sleepName(60)
-	cmd, _ := pm.NewExecCmd(name, args, procman.WithGracePeriod(100*time.Millisecond))
-	cmd.Start()
-	if err := pm.Shutdown(); err != nil {
-		t.Fatalf("Shutdown: %v", err)
-	}
-	if !cmd.IsExited() {
-		t.Fatal("expected exited after Shutdown")
-	}
-	if onExit.Load() != 1 {
-		t.Fatalf("expected 1 OnExit, got %d", onExit.Load())
-	}
-}
 
 // TestWindowsParentDeath verifies that children with WithParentDeathCleanup
 // are terminated by the kernel when the parent process is killed. It spawns
@@ -248,7 +116,7 @@ func TestWindowsParentDeathHelper(t *testing.T) {
 
 	for i := range 3 {
 		cmd, err := pm.NewExecCmd(self,
-			procman.Args("--procman-sleep", "120"),
+			procman.Args(testSleepMode, "120"),
 			procman.WithParentDeathCleanup(),
 		)
 		if err != nil {
