@@ -32,10 +32,10 @@ command that already has one, distinguishable from the reaper only by who wins.
 consumer writes the same `if state != nil { state.ExitCode() }` dance and has to account for its
 platform-specific termination status.
 
-The result is visible in the first consumer. `zirafa-core/core.ProcessManager` runs a `reap`
-goroutine per process that calls `ecmd.Wait()`, reads `GetProcessState().ExitCode()`, and closes
-its own `done` channel — a duplicate of procman's reaper, existing only because procman's is not
-observable. See [mainvec/zirafa#19](https://github.com/mainvec/zirafa/issues/19).
+The result is visible in a typical consumer. A process manager that wraps procman runs a
+`reap` goroutine per process that calls `ecmd.Wait()`, reads `GetProcessState().ExitCode()`, and
+closes its own `done` channel — a duplicate of procman's reaper, existing only because procman's
+is not observable.
 
 Success looks like: a consumer can learn that a command exited, and with what status, without
 starting a goroutine of its own and without an event it might not receive.
@@ -240,9 +240,9 @@ sets, so there is one write and it happens before the exit hook and before `Done
 ended the process — the doc comment says so, because the difference is invisible from here and a
 caller measuring shutdown latency would otherwise be measuring the reaper's scheduling.
 
-The alternative was leaving it to each consumer, which is what the first consumer was doing: a mutex
-and a hook body on `zirafa-core`'s `ManagedProcess` existing only to timestamp something `procman`
-was already standing over. Both are now gone.
+The alternative was leaving it to each consumer, which is what a typical consumer was doing: a
+mutex and a hook body on its own managed-process wrapper existing only to timestamp something
+`procman` was already standing over. Both are now gone.
 
 ## Risks and Compatibility
 
@@ -271,8 +271,8 @@ FreeBSD test binaries cross-compiled successfully.
 
 ## Rollout
 
-Additive; no migration. The first consumer is `zirafa-core`, which deletes its duplicate reaper in
-the same change.
+Additive; no migration. Consumers can delete their duplicate reaper goroutines in a follow-up
+change.
 
 ## Decision Log
 
