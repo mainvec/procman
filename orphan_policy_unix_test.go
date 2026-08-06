@@ -36,10 +36,19 @@ func TestTerminatePolicyStopsProcessTree(t *testing.T) {
 	if err := cmd.Stop(); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
-	if processExists(descendantPID) {
-		_ = syscall.Kill(descendantPID, syscall.SIGKILL)
-		t.Fatalf("expected descendant %d to be terminated", descendantPID)
+	// Stop waits for the direct child (the shell) to be reaped, not for
+	// descendants killed via process-group signal. On a slow CI runner the
+	// descendant may still be exiting when Stop returns, so poll briefly
+	// instead of checking once.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !processExists(descendantPID) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
+	_ = syscall.Kill(descendantPID, syscall.SIGKILL)
+	t.Fatalf("expected descendant %d to be terminated", descendantPID)
 }
 
 func waitForPIDFile(t *testing.T, path string) int {
