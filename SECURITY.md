@@ -14,11 +14,8 @@
 **Do not open a public GitHub issue for security vulnerabilities.**
 
 If you discover a security vulnerability in `procman`, please report it
-privately:
-
-1. **Email**: Send details to **security@mainvec.com**.
-2. **GitHub private vulnerability reporting**: Use GitHub's [private
-   vulnerability reporting][gh-pvr] feature on the repository.
+privately using GitHub's [private vulnerability reporting][gh-pvr] feature
+on the repository.
 
 Include as much of the following as possible:
 
