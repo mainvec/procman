@@ -108,6 +108,14 @@ func forceKill(child *ExecCmd) error {
 	return err
 }
 
+// treeAlive reports false: the reaper closes the command's Job Object as soon
+// as the direct child is reaped, so the tree can no longer be observed or
+// terminated as a unit. Descendants are covered only while the direct child
+// runs, or by kill-on-close when parent-death cleanup is enabled.
+func treeAlive(child *ExecCmd) bool {
+	return false
+}
+
 func processIsAlive(proc *os.Process) bool {
 	const stillActive = 259 // STILL_ACTIVE
 	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(proc.Pid))

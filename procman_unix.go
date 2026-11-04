@@ -36,14 +36,35 @@ func gracefulSignal(child *ExecCmd) error {
 	if child.processTreeTermination {
 		return signalProcessGroup(child.cmd.Process.Pid, syscall.SIGTERM)
 	}
-	return child.cmd.Process.Signal(syscall.SIGTERM)
+	return ignoreProcessDone(child.cmd.Process.Signal(syscall.SIGTERM))
 }
 
 func forceKill(child *ExecCmd) error {
 	if child.processTreeTermination {
 		return signalProcessGroup(child.cmd.Process.Pid, syscall.SIGKILL)
 	}
-	return child.cmd.Process.Kill()
+	return ignoreProcessDone(child.cmd.Process.Kill())
+}
+
+// ignoreProcessDone treats a child the reaper has already collected as stopped.
+// Stop checks status under the lock and signals after releasing it, so the
+// reaper can win that race; the outcome the caller wanted has happened.
+func ignoreProcessDone(err error) error {
+	if errors.Is(err, os.ErrProcessDone) {
+		return nil
+	}
+	return err
+}
+
+// treeAlive reports whether any process remains in the command's process
+// group. It is only consulted by a stop already in progress, from the moment
+// the group leader is reaped until the group is first seen empty. While a
+// member remains, POSIX does not reuse the group's ID.
+func treeAlive(child *ExecCmd) bool {
+	if !child.processTreeTermination {
+		return false
+	}
+	return syscall.Kill(-child.cmd.Process.Pid, 0) == nil
 }
 
 func signalProcessGroup(pid int, signal syscall.Signal) error {
