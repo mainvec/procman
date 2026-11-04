@@ -325,7 +325,8 @@ func (pm *Procman) notifyOnStart(ecmd *ExecCmd) {
 	default:
 		pm.evtInFlight.Done() // dropped — not in flight
 		if pm.logger != nil {
-			pm.logger.Warn("procman: notifyOnStart: dropping event for %s[%v] (channel full)", ecmd.Name, ecmd.ID())
+			pm.logger.Warn("procman: dropping start event; callback queue full",
+				"name", ecmd.Name, "id", ecmd.ID().String())
 		}
 	}
 }
@@ -342,7 +343,8 @@ func (pm *Procman) notifyOnExit(ecmd *ExecCmd, err error) {
 	default:
 		pm.evtInFlight.Done()
 		if pm.logger != nil {
-			pm.logger.Warn("procman: notifyOnExit: dropping event for %s[%v] (channel full)", ecmd.Name, ecmd.ID())
+			pm.logger.Warn("procman: dropping exit event; callback queue full",
+				"name", ecmd.Name, "id", ecmd.ID().String())
 		}
 	}
 }
@@ -383,10 +385,16 @@ func (p *Procman) NewExecCmdFromCmd(cmd *exec.Cmd, opts ...ExecCmdOption) (*Exec
 			return nil, err
 		}
 	}
+	// exec.Cmd runs {Path} when Args is empty, so a literal &exec.Cmd{Path: p}
+	// is valid and must not be indexed.
+	name, args := cmd.Path, []string(nil)
+	if len(cmd.Args) > 0 {
+		name, args = cmd.Args[0], cmd.Args[1:]
+	}
 	childId := NewID()
 	child := &ExecCmd{
-		Name:                   cmd.Args[0],
-		Args:                   cmd.Args[1:],
+		Name:                   name,
+		Args:                   args,
 		procman:                p,
 		procmanId:              childId,
 		cmd:                    cmd, // store now; Start() will use it
@@ -434,8 +442,11 @@ func (p *Procman) ListExecCmdes() []*ExecCmd {
 	return children
 }
 
-// KillAll requests immediate, non-graceful termination of every started
+// KillAll requests immediate, non-graceful termination of every running
 // command. It ignores termination errors and does not wait for process exit.
+// Commands that have already been reaped are skipped: their process ID, and
+// with WithProcessTreeTermination their process-group ID, may since have been
+// reused by an unrelated process.
 func (p *Procman) KillAll() {
 	p.mu.RLock()
 	cmds := make([]*ExecCmd, 0, len(p.execCmds))
@@ -445,13 +456,13 @@ func (p *Procman) KillAll() {
 	p.mu.RUnlock()
 	for _, child := range cmds {
 		child.mu.Lock()
-		started := child.started
-		cmd := child.cmd
-		if started && cmd != nil && cmd.Process != nil && child.status == ExecCmdStatusRunning {
+		running := child.started && child.cmd != nil && child.cmd.Process != nil &&
+			child.status == ExecCmdStatusRunning
+		if running {
 			child.stopRequested = true
 		}
 		child.mu.Unlock()
-		if started && cmd != nil && cmd.Process != nil {
+		if running {
 			_ = forceKill(child)
 		}
 	}
@@ -659,20 +670,21 @@ func (c *ExecCmd) Wait() error {
 // grace period expires, Stop forces termination and waits for reaping. A zero
 // grace period waits indefinitely after the graceful signal. Concurrent calls
 // share the same stop operation and result.
+//
+// With WithProcessTreeTermination and a positive grace period, Stop also waits
+// for the rest of the process tree: descendants still running when the direct
+// child exits get the remainder of the grace period, and are then killed. On
+// Unix this covers the command's process group. With a zero grace period Stop
+// returns once the direct child has been reaped.
 func (c *ExecCmd) Stop() error {
 	c.mu.Lock()
 	if !c.started || c.cmd == nil || c.cmd.Process == nil {
 		c.mu.Unlock()
 		return ErrExecCmdNotStarted
 	}
-	if c.status != ExecCmdStatusRunning {
-		c.mu.Unlock()
-		return nil
-	}
-	// Set only once the command is known to be alive, so that stopping something
-	// that has already died is not mistaken for having stopped it.
-	c.stopRequested = true
-	doneChan := c.doneChan
+	// Checked before status: the direct child may already be reaped while a stop
+	// is still waiting for the rest of its process tree, and a concurrent caller
+	// must share that wait rather than return early.
 	if c.stopping {
 		stopDone := c.stopDone
 		c.mu.Unlock()
@@ -682,6 +694,14 @@ func (c *ExecCmd) Stop() error {
 		c.mu.RUnlock()
 		return err
 	}
+	if c.status != ExecCmdStatusRunning {
+		c.mu.Unlock()
+		return nil
+	}
+	// Set only once the command is known to be alive, so that stopping something
+	// that has already died is not mistaken for having stopped it.
+	c.stopRequested = true
+	doneChan := c.doneChan
 	c.stopping = true
 	c.stopDone = make(chan struct{})
 	stopDone := c.stopDone
@@ -714,7 +734,6 @@ func (c *ExecCmd) Stop() error {
 	defer timer.Stop()
 	select {
 	case <-doneChan:
-		return complete(nil)
 	case <-timer.C:
 		if err := forceKill(c); err != nil {
 			return complete(err)
@@ -722,6 +741,33 @@ func (c *ExecCmd) Stop() error {
 		<-doneChan
 		return complete(nil)
 	}
+	if !c.processTreeTermination {
+		return complete(nil)
+	}
+	// The direct child exited within the grace period, but descendants may have
+	// ignored the graceful signal. Give them what is left of it.
+	return complete(awaitTreeExit(c, timer.C))
+}
+
+// treePollInterval is how often Stop checks whether a process tree has emptied
+// after its direct child exited. No platform used here offers a notification.
+const treePollInterval = 20 * time.Millisecond
+
+// awaitTreeExit waits until no process remains in c's tree, or until deadline
+// fires, in which case it kills whatever remains. It stops checking at the
+// first observation of an empty tree, so it never acts on an identifier that
+// may since have been reused.
+func awaitTreeExit(c *ExecCmd, deadline <-chan time.Time) error {
+	ticker := time.NewTicker(treePollInterval)
+	defer ticker.Stop()
+	for treeAlive(c) {
+		select {
+		case <-deadline:
+			return forceKill(c)
+		case <-ticker.C:
+		}
+	}
+	return nil
 }
 
 // GetProcessState returns the child's process state after it has been reaped.

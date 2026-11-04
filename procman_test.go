@@ -391,3 +391,20 @@ func TestProcessLifecycleOptions(t *testing.T) {
 		t.Fatalf("expected ErrParentDeathCleanupUnsupported, got %v", err)
 	}
 }
+
+func TestNewExecCmdFromCmdAcceptsCommandWithoutArgs(t *testing.T) {
+	pm := procman.NewProcman()
+	t.Cleanup(func() { _ = pm.Shutdown() })
+
+	name, _ := testExitCommand(t, 0)
+	cmd, err := pm.NewExecCmdFromCmd(&exec.Cmd{Path: name})
+	if err != nil {
+		t.Fatalf("NewExecCmdFromCmd: %v", err)
+	}
+	if cmd.Name != name {
+		t.Errorf("Name = %q, want %q", cmd.Name, name)
+	}
+	if len(cmd.Args) != 0 {
+		t.Errorf("Args = %q, want none", cmd.Args)
+	}
+}

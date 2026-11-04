@@ -233,8 +233,15 @@ If the grace period is greater than zero, procman force-kills a process that
 does not exit before the period expires. With the default zero grace period,
 procman sends the graceful signal and waits without a forced-kill timeout.
 
+With `WithProcessTreeTermination` and a positive grace period, `Stop` also
+waits for the rest of the tree on Unix: descendants still running after the
+direct child exits get the remainder of the grace period and are then killed
+with the process group. With a zero grace period, `Stop` returns once the
+direct child has been reaped.
+
 Calling `Stop` before `Start` returns `procman.ErrExecCmdNotStarted`. Repeated
-concurrent calls wait for the same process exit.
+concurrent calls wait for the same stop operation, including any wait for the
+process tree.
 
 Stop every currently running command concurrently:
 
@@ -244,7 +251,9 @@ if err := pm.StopAll(); err != nil {
 }
 ```
 
-`KillAll` is the immediate, non-graceful alternative.
+`KillAll` is the immediate, non-graceful alternative. It targets only commands
+that are still running: once a command has been reaped, its process ID and
+process-group ID may belong to an unrelated process.
 
 Use `Shutdown` when the process manager itself is no longer needed:
 
@@ -339,6 +348,12 @@ need application-specific shutdown mechanisms.
 - Linux `Pdeathsig` follows OS-thread lifetime, not Go process lifetime.
 - Descendants that deliberately leave their process group or Windows Job Object
 	are outside procman's control.
+- Process-tree cleanup after the direct child exits happens only within `Stop`
+	with a positive grace period, and only on Unix. On Windows the Job Object is
+	closed when the direct child is reaped, so surviving descendants are not
+	terminated unless parent-death cleanup enabled kill-on-close.
+- Descendants left behind by a direct child that exited on its own are not
+	cleaned up; `KillAll` and `StopAll` skip commands that are no longer running.
 - Restart policy options exist, but restart behavior is not implemented yet.
 
 ## TODO

@@ -51,6 +51,108 @@ func TestTerminatePolicyStopsProcessTree(t *testing.T) {
 	t.Fatalf("expected descendant %d to be terminated", descendantPID)
 }
 
+// startTreeWithStubbornDescendant starts a shell that leaves a descendant
+// ignoring SIGTERM, then itself exits on SIGTERM, and returns the descendant's
+// PID. The descendant shares the shell's process group.
+func startTreeWithStubbornDescendant(t *testing.T, pm *procman.Procman, grace time.Duration) (*procman.ExecCmd, int) {
+	t.Helper()
+	pidFile := filepath.Join(t.TempDir(), "descendant.pid")
+	cmd, err := pm.NewExecCmd("/bin/sh", procman.Args("-c",
+		fmt.Sprintf(`trap '' TERM; sleep 60 & echo $! > %q; trap - TERM; wait`, pidFile)),
+		procman.WithGracePeriod(grace),
+		procman.WithProcessTreeTermination(),
+	)
+	if err != nil {
+		t.Fatalf("NewExecCmd: %v", err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	pid := waitForPIDFile(t, pidFile)
+	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+	return cmd, pid
+}
+
+func awaitProcessGone(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !processExists(pid) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("expected process %d to be terminated", pid)
+}
+
+func TestStopKillsDescendantsThatOutliveTheDirectChild(t *testing.T) {
+	pm := procman.NewProcman()
+	t.Cleanup(func() { _ = pm.Shutdown() })
+	cmd, descendantPID := startTreeWithStubbornDescendant(t, pm, 300*time.Millisecond)
+
+	if err := cmd.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	awaitProcessGone(t, descendantPID)
+}
+
+func TestConcurrentStopWaitsForTheProcessTree(t *testing.T) {
+	pm := procman.NewProcman()
+	t.Cleanup(func() { _ = pm.Shutdown() })
+	cmd, descendantPID := startTreeWithStubbornDescendant(t, pm, time.Second)
+
+	first := make(chan error, 1)
+	go func() { first <- cmd.Stop() }()
+	select {
+	case <-cmd.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("direct child did not exit after SIGTERM")
+	}
+
+	// The direct child is reaped; the first Stop is still waiting on the tree.
+	if err := cmd.Stop(); err != nil {
+		t.Fatalf("second Stop: %v", err)
+	}
+	select {
+	case err := <-first:
+		if err != nil {
+			t.Fatalf("first Stop: %v", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("second Stop returned while the first was still waiting for the tree")
+	}
+	awaitProcessGone(t, descendantPID)
+}
+
+func TestKillAllSkipsReapedCommands(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "descendant.pid")
+	pm := procman.NewProcman()
+	t.Cleanup(func() { _ = pm.Shutdown() })
+
+	// The shell exits at once, leaving a descendant in its process group.
+	cmd, err := pm.NewExecCmd("/bin/sh", procman.Args("-c",
+		fmt.Sprintf(`sleep 60 & echo $! > %q`, pidFile)),
+		procman.WithProcessTreeTermination(),
+	)
+	if err != nil {
+		t.Fatalf("NewExecCmd: %v", err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	descendantPID := waitForPIDFile(t, pidFile)
+	t.Cleanup(func() { _ = syscall.Kill(descendantPID, syscall.SIGKILL) })
+	<-cmd.Done()
+
+	// Once its leader is reaped, procman cannot tell this group from one that
+	// later reuses the ID, so KillAll must leave it alone.
+	pm.KillAll()
+	time.Sleep(200 * time.Millisecond)
+	if !processExists(descendantPID) {
+		t.Fatal("KillAll signalled the process group of an already-reaped command")
+	}
+}
+
 func waitForPIDFile(t *testing.T, path string) int {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
