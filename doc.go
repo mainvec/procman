@@ -29,4 +29,13 @@
 // process, because it runs on the reaper goroutine where nothing can recover
 // for it. An exit hook must not call Wait or Shutdown, because both wait for the
 // hook to return. Use these where missing an exit would be a bug.
+//
+// # Descendants
+//
+// With WithProcessTreeTermination, Done means the direct child has been
+// reaped; ExecCmd.TreeDone means nothing is left in its tree. In between,
+// procman tracks the leftover descendants so Stop, StopAll, KillAll and
+// Shutdown can still reach them, and WithOrphanCleanup stops them as soon as
+// the direct child exits on its own. A tree observed empty is never signalled
+// again, because its identifiers may since have been reused.
 package procman

@@ -19,6 +19,7 @@ const (
 	testSleepMode      = "--procman-sleep"
 	testPrintArgv0Mode = "--procman-print-argv0"
 	testExitMode       = "--procman-exit"
+	testSpawnMode      = "--procman-spawn-sleeper"
 )
 
 func init() {
@@ -40,6 +41,23 @@ func init() {
 			os.Exit(2)
 		}
 		os.Exit(code)
+	case testSpawnMode:
+		// Leave a sleeping descendant behind and exit. The pause first lets the
+		// parent finish placing this process in its Job Object on Windows, which
+		// it can only do once the process exists.
+		time.Sleep(300 * time.Millisecond)
+		self, err := os.Executable()
+		if err != nil {
+			os.Exit(2)
+		}
+		child := exec.Command(self, testSleepMode, os.Args[2])
+		if err := child.Start(); err != nil {
+			os.Exit(2)
+		}
+		if len(os.Args) > 3 {
+			_ = os.WriteFile(os.Args[3], []byte(strconv.Itoa(child.Process.Pid)), 0o600)
+		}
+		os.Exit(0)
 	case testPrintArgv0Mode:
 		_, _ = os.Stdout.WriteString(os.Args[0])
 		os.Exit(0)

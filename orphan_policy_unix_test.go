@@ -3,9 +3,11 @@
 package procman_test
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -124,15 +126,17 @@ func TestConcurrentStopWaitsForTheProcessTree(t *testing.T) {
 	awaitProcessGone(t, descendantPID)
 }
 
-func TestKillAllSkipsReapedCommands(t *testing.T) {
+func TestOrphanCleanupKillsDescendantsThatIgnoreSIGTERM(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "descendant.pid")
 	pm := procman.NewProcman()
 	t.Cleanup(func() { _ = pm.Shutdown() })
 
-	// The shell exits at once, leaving a descendant in its process group.
+	const grace = 300 * time.Millisecond
 	cmd, err := pm.NewExecCmd("/bin/sh", procman.Args("-c",
-		fmt.Sprintf(`sleep 60 & echo $! > %q`, pidFile)),
+		fmt.Sprintf(`trap '' TERM; sleep 60 & echo $! > %q`, pidFile)),
 		procman.WithProcessTreeTermination(),
+		procman.WithOrphanCleanup(),
+		procman.WithGracePeriod(grace),
 	)
 	if err != nil {
 		t.Fatalf("NewExecCmd: %v", err)
@@ -143,14 +147,59 @@ func TestKillAllSkipsReapedCommands(t *testing.T) {
 	descendantPID := waitForPIDFile(t, pidFile)
 	t.Cleanup(func() { _ = syscall.Kill(descendantPID, syscall.SIGKILL) })
 	<-cmd.Done()
+	exited := time.Now()
 
-	// Once its leader is reaped, procman cannot tell this group from one that
-	// later reuses the ID, so KillAll must leave it alone.
-	pm.KillAll()
-	time.Sleep(200 * time.Millisecond)
-	if !processExists(descendantPID) {
-		t.Fatal("KillAll signalled the process group of an already-reaped command")
+	awaitTreeDone(t, cmd, 5*time.Second)
+	if elapsed := time.Since(exited); elapsed < grace/2 {
+		t.Errorf("tree ended after %v; a descendant ignoring SIGTERM should get the grace period", elapsed)
 	}
+	awaitProcessGone(t, descendantPID)
+	if cmd.StopRequested() {
+		t.Error("StopRequested() is true for a command that exited on its own")
+	}
+}
+
+// A direct child that has died while Wait is still draining its output pipes
+// is not alive to the operating system, but its descendants keep the pipes
+// open and Done open with them. StopAll used to skip such a command, and
+// Shutdown then waited on Done for as long as the descendants lived.
+func TestShutdownReachesDescendantsHoldingOutputPipes(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "descendant.pid")
+	pm := procman.NewProcman()
+
+	native := exec.Command("/bin/sh", "-c", fmt.Sprintf(`sleep 60 & echo $! > %q`, pidFile))
+	var stdout bytes.Buffer
+	native.Stdout = &stdout
+	cmd, err := pm.NewExecCmdFromCmd(native,
+		procman.WithProcessTreeTermination(),
+		procman.WithGracePeriod(time.Second),
+	)
+	if err != nil {
+		t.Fatalf("NewExecCmdFromCmd: %v", err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	descendantPID := waitForPIDFile(t, pidFile)
+	t.Cleanup(func() { _ = syscall.Kill(descendantPID, syscall.SIGKILL) })
+	awaitProcessGone(t, cmd.Pid())
+	select {
+	case <-cmd.Done():
+		t.Fatal("Done closed while a descendant still holds the output pipe")
+	default:
+	}
+
+	shutdown := make(chan error, 1)
+	go func() { shutdown <- pm.Shutdown() }()
+	select {
+	case err := <-shutdown:
+		if err != nil {
+			t.Fatalf("Shutdown: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Shutdown did not reach the descendant holding the output pipe")
+	}
+	awaitProcessGone(t, descendantPID)
 }
 
 func waitForPIDFile(t *testing.T, path string) int {

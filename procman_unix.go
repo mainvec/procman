@@ -56,15 +56,30 @@ func ignoreProcessDone(err error) error {
 	return err
 }
 
-// treeAlive reports whether any process remains in the command's process
-// group. It is only consulted by a stop already in progress, from the moment
-// the group leader is reaped until the group is first seen empty. While a
-// member remains, POSIX does not reuse the group's ID.
+// gracefulTreeSignal reports that a tree whose direct child has been reaped
+// can still be signalled gracefully: its process group outlives the leader.
+const gracefulTreeSignal = true
+
+// treeAlive reports whether any signallable process remains in the command's
+// process group. It is consulted when the group leader is reaped, and from
+// then on only while the group is tracked, until it is first seen empty. While
+// a member remains, POSIX does not reuse the group's ID. A group whose only
+// members refuse our signals (EPERM) counts as empty: nothing could be done
+// to them anyway.
 func treeAlive(child *ExecCmd) bool {
 	if !child.processTreeTermination {
 		return false
 	}
 	return syscall.Kill(-child.cmd.Process.Pid, 0) == nil
+}
+
+// signalTree signals the command's process group after its leader has been
+// reaped. Callers ensure the group has just been seen populated.
+func signalTree(child *ExecCmd, graceful bool) error {
+	if graceful {
+		return signalProcessGroup(child.cmd.Process.Pid, syscall.SIGTERM)
+	}
+	return signalProcessGroup(child.cmd.Process.Pid, syscall.SIGKILL)
 }
 
 func signalProcessGroup(pid int, signal syscall.Signal) error {
