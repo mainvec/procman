@@ -123,14 +123,16 @@ cleanup. The option returns `procman.ErrParentDeathCleanupUnsupported` on
 unsupported platforms. Its behavior is platform-specific:
 
 - Linux configures `Pdeathsig=SIGKILL`, so the kernel kills the direct child
-	when its creating parent thread exits. Descendants are not covered.
+	when the procman-owning process dies. Descendants are not covered.
 - Windows uses a kill-on-close Job Object, which terminates the process tree.
 - macOS and other non-Linux Unix platforms are currently unsupported.
 
-Linux ties `Pdeathsig` to the creating OS thread rather than the whole parent
-process. It handles abrupt process exit because all threads terminate, but the
-Go runtime may move goroutines or retire OS threads. It is therefore not as
-strong a process-lifetime guarantee as a Windows Job Object.
+The kernel delivers `Pdeathsig` when the *thread* that forked the child exits,
+not when the process does, and Go terminates an OS thread whenever a goroutine
+locked to it returns. Procman therefore starts these commands from one
+dedicated OS thread that stays locked for the life of the process, so the
+signal fires only when the procman-owning process itself dies. That thread is
+created on first use, and starts that use it are serialised.
 
 To configure environment variables, working directory, standard streams, or
 other `os/exec` fields, create an `*exec.Cmd` first:
@@ -403,7 +405,6 @@ need application-specific shutdown mechanisms.
 
 - Parent-death cleanup is opt-in and unsupported on non-Linux Unix platforms.
 - Linux parent-death cleanup covers only the direct child, not descendants.
-- Linux `Pdeathsig` follows OS-thread lifetime, not Go process lifetime.
 - Descendants that deliberately leave their process group or Windows Job Object
 	are outside procman's control.
 - Descendant tracking covers only the command's process group (Unix) or Job

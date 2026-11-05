@@ -56,6 +56,10 @@ func prepareExecCmd(child *ExecCmd) error {
 	return nil
 }
 
+func startProcess(child *ExecCmd) error {
+	return child.cmd.Start()
+}
+
 func finishExecCmdStart(child *ExecCmd) error {
 	child.platform.mu.Lock()
 	defer child.platform.mu.Unlock()

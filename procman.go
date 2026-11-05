@@ -593,7 +593,7 @@ func (c *ExecCmd) start() error {
 		c.mu.Unlock()
 		return err
 	}
-	err := cmd.Start()
+	err := startProcess(c)
 	if err != nil {
 		cleanupExecCmd(c)
 		c.status = ExecCmdStatusFailed
