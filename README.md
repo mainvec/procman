@@ -150,6 +150,16 @@ cmd, err := pm.NewExecCmdFromCmd(nativeCmd,
 The supplied command must not already be started. Procman executes that exact
 `*exec.Cmd` without rebuilding it.
 
+When `Stdout` or `Stderr` is a writer rather than an `*os.File`, `os/exec`
+copies the output through a pipe, and `Wait` (and with it `Done`) returns only
+once every process holding that pipe has closed it, descendants included. A
+descendant that outlives the command then delays `Done` for as long as it runs.
+Set `exec.Cmd.WaitDelay` to bound that wait, and use process-tree termination
+so procman can still reach the descendant afterwards (see
+[Descendants that outlive the command](#descendants-that-outlive-the-command)).
+Do not use `StdoutPipe` or `StderrPipe`: the reaper calls `Wait` as soon as the
+child exits, which closes those pipes under whatever is reading them.
+
 ## Waiting and exit status
 
 `Wait` blocks until the process has exited and been reaped, then returns the
@@ -207,6 +217,8 @@ Available state methods:
 - `IsRunning()` checks whether the process is still running.
 - `IsExited()` reports a successful or unsuccessful exit.
 - `Done()` returns a channel closed after the process is reaped.
+- `TreeDone()` returns a channel closed once no process remains in the
+	command's tree; see below.
 - `ExitCode()` returns the platform process exit status, or `-1` before reaping.
 - `StopRequested()` reports whether this `Procman` asked the command to stop.
 - `StartedAt()` returns when the command started, or the zero time before that.
@@ -233,11 +245,10 @@ If the grace period is greater than zero, procman force-kills a process that
 does not exit before the period expires. With the default zero grace period,
 procman sends the graceful signal and waits without a forced-kill timeout.
 
-With `WithProcessTreeTermination` and a positive grace period, `Stop` also
-waits for the rest of the tree on Unix: descendants still running after the
-direct child exits get the remainder of the grace period and are then killed
-with the process group. With a zero grace period, `Stop` returns once the
-direct child has been reaped.
+With `WithProcessTreeTermination` and a positive grace period, `Stop` returns
+only once the whole tree is gone: descendants still running after the direct
+child exits get the remainder of the grace period and are then killed with the
+tree. With a zero grace period, `Stop` does not wait for descendants.
 
 Calling `Stop` before `Start` returns `procman.ErrExecCmdNotStarted`. Repeated
 concurrent calls wait for the same stop operation, including any wait for the
@@ -251,9 +262,8 @@ if err := pm.StopAll(); err != nil {
 }
 ```
 
-`KillAll` is the immediate, non-graceful alternative. It targets only commands
-that are still running: once a command has been reaped, its process ID and
-process-group ID may belong to an unrelated process.
+`KillAll` is the immediate, non-graceful alternative. It reaches running
+commands and the tracked descendants of commands that have already exited.
 
 Use `Shutdown` when the process manager itself is no longer needed:
 
@@ -264,9 +274,53 @@ if err := pm.Shutdown(); err != nil {
 ```
 
 `Shutdown` rejects new commands, prevents registered unstarted commands from
-starting, stops running commands, drains lifecycle callbacks, and stops the
-event loop. It is safe to call concurrently or more than once. Command creation
+starting, stops running commands and tracked descendants, drains lifecycle
+callbacks, and stops the event loop. It is safe to call concurrently or more than once. Command creation
 and start attempts after shutdown return `procman.ErrProcmanShutdown`.
+
+### Descendants that outlive the command
+
+With `WithProcessTreeTermination`, a direct child can exit — crash, or finish —
+while processes it started keep running in its tree: its process group on
+Unix, its Job Object on Windows. Procman keeps tracking that tree after the
+direct child is reaped, until it is first observed empty:
+
+```go
+<-cmd.Done()     // the direct child has been reaped
+<-cmd.TreeDone() // and nothing is left in its tree
+```
+
+While a tree is tracked, `Stop`, `StopAll`, `KillAll`, and `Shutdown` reach the
+remaining descendants. Without further configuration they are otherwise left
+running. `WithOrphanCleanup` stops them as soon as the direct child exits on its
+own, with the same graceful signal, grace period and forced termination as
+`Stop`:
+
+```go
+cmd, err := pm.NewExecCmd(
+	"worker",
+	procman.Args("--queue", "emails"),
+	procman.WithProcessTreeTermination(),
+	procman.WithOrphanCleanup(),
+	procman.WithGracePeriod(10*time.Second),
+)
+```
+
+`WithOrphanCleanup` requires `WithProcessTreeTermination`. It does not act when
+the exit was requested through `Stop` or `KillAll`, which handle the tree
+themselves, and it does not set `StopRequested`: the command still exited on its
+own.
+
+Once a tree has been observed empty, procman never signals it again, because on
+Unix its process-group ID may then be reused by an unrelated process group. Each
+signal to a tracked tree is preceded by a fresh check that it still has members,
+under the same lock that ends tracking. Tracking costs one check every 50ms per
+tree with leftovers, until the tree empties.
+
+On Windows, descendants left after the direct child exits receive no graceful
+signal: `CTRL_BREAK_EVENT` addresses a process group by its leader's PID, which
+Windows may already have reused. `Stop` terminates them through the Job Object
+at once.
 
 ## Lifecycle callbacks
 
@@ -322,7 +376,8 @@ cmd, ok := pm.GetExecCmd(id)
 cmds := pm.ListExecCmdes()
 ```
 
-`StopAll` ignores commands that are not running.
+`StopAll` ignores commands that have not started, and commands that have exited
+with nothing left in their tree.
 
 ## Platform behavior
 
@@ -334,7 +389,10 @@ cmds := pm.ListExecCmdes()
 - Windows console processes: graceful stop sends `CTRL_BREAK_EVENT` to the
 	child's process group. Process-tree termination and parent-death cleanup use
 	a Job Object; parent-death cleanup enables kill-on-close so the process tree
-	is terminated if the procman-owning application exits unexpectedly.
+	is terminated if the procman-owning application exits unexpectedly. With
+	process-tree termination the Job Object stays open while descendants outlive
+	the direct child, so they remain reachable; with parent-death cleanup alone it
+	is closed when the direct child is reaped, which kills any descendants.
 - Forced shutdown uses the platform's immediate process-kill operation.
 
 Windows graceful shutdown requires a console process that handles
@@ -348,12 +406,13 @@ need application-specific shutdown mechanisms.
 - Linux `Pdeathsig` follows OS-thread lifetime, not Go process lifetime.
 - Descendants that deliberately leave their process group or Windows Job Object
 	are outside procman's control.
-- Process-tree cleanup after the direct child exits happens only within `Stop`
-	with a positive grace period, and only on Unix. On Windows the Job Object is
-	closed when the direct child is reaped, so surviving descendants are not
-	terminated unless parent-death cleanup enabled kill-on-close.
-- Descendants left behind by a direct child that exited on its own are not
-	cleaned up; `KillAll` and `StopAll` skip commands that are no longer running.
+- Descendant tracking covers only the command's process group (Unix) or Job
+	Object (Windows). A descendant that leaves it is not tracked and not counted
+	by `TreeDone`.
+- Tracking polls; neither platform offers an exit notification for a process
+	group or job that procman is not the parent of.
+- On Windows, a child can start processes in the moment between its creation
+	and its assignment to the Job Object; those escape the job.
 - Restart policy options exist, but restart behavior is not implemented yet.
 
 ## TODO

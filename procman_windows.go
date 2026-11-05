@@ -108,12 +108,64 @@ func forceKill(child *ExecCmd) error {
 	return err
 }
 
-// treeAlive reports false: the reaper closes the command's Job Object as soon
-// as the direct child is reaped, so the tree can no longer be observed or
-// terminated as a unit. Descendants are covered only while the direct child
-// runs, or by kill-on-close when parent-death cleanup is enabled.
+// gracefulTreeSignal reports that a tree whose direct child has been reaped
+// cannot be signalled gracefully. CTRL_BREAK_EVENT addresses a console process
+// group by its leader's PID, and Windows reuses PIDs freely once the leader is
+// gone. Such a tree is terminated through its Job Object instead.
+const gracefulTreeSignal = false
+
+// jobBasicAccounting mirrors JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, which
+// golang.org/x/sys/windows does not define.
+type jobBasicAccounting struct {
+	TotalUserTime             int64
+	TotalKernelTime           int64
+	ThisPeriodTotalUserTime   int64
+	ThisPeriodTotalKernelTime int64
+	TotalPageFaultCount       uint32
+	TotalProcesses            uint32
+	ActiveProcesses           uint32
+	TotalTerminatedProcesses  uint32
+}
+
+// treeAlive reports whether the command's Job Object still holds a running
+// process. Only process-tree termination keeps the job open past the direct
+// child: with parent-death cleanup alone, the reaper closes it as before and
+// kill-on-close ends any descendants. The job handle, unlike a PID, cannot be
+// reused while procman holds it.
 func treeAlive(child *ExecCmd) bool {
-	return false
+	if !child.processTreeTermination {
+		return false
+	}
+	child.platform.mu.Lock()
+	defer child.platform.mu.Unlock()
+	if child.platform.job == 0 {
+		return false
+	}
+	var info jobBasicAccounting
+	if err := windows.QueryInformationJobObject(
+		child.platform.job,
+		windows.JobObjectBasicAccountingInformation,
+		uintptr(unsafe.Pointer(&info)),
+		uint32(unsafe.Sizeof(info)),
+		nil,
+	); err != nil {
+		return false
+	}
+	return info.ActiveProcesses > 0
+}
+
+// signalTree terminates the command's Job Object after its direct child has
+// been reaped. graceful is never true here; see gracefulTreeSignal.
+func signalTree(child *ExecCmd, graceful bool) error {
+	if graceful {
+		return nil
+	}
+	child.platform.mu.Lock()
+	defer child.platform.mu.Unlock()
+	if child.platform.job == 0 {
+		return nil
+	}
+	return windows.TerminateJobObject(child.platform.job, 1)
 }
 
 func processIsAlive(proc *os.Process) bool {

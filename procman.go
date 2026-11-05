@@ -31,6 +31,7 @@ type execCmdOptions struct {
 	gracePeriod            time.Duration
 	processTreeTermination bool
 	parentDeathCleanup     bool
+	orphanCleanup          bool
 	onStart                func(*ExecCmd)
 	onExit                 func(*ExecCmd, error)
 	// future fields: Env, Dir, Stdout, Stderr, etc.
@@ -89,6 +90,20 @@ func WithGracePeriod(d time.Duration) ExecCmdOption {
 func WithProcessTreeTermination() ExecCmdOption {
 	return func(o *execCmdOptions) error {
 		o.processTreeTermination = true
+		return nil
+	}
+}
+
+// WithOrphanCleanup terminates the descendants a command's direct child leaves
+// behind when it exits on its own, rather than leaving them for a later Stop,
+// StopAll, KillAll or Shutdown. They are stopped as Stop would: a graceful
+// signal, the command's grace period, then forced termination. It requires
+// WithProcessTreeTermination, which defines the tree; command creation fails
+// without it. It does not act when the exit was requested through Stop or
+// KillAll, which handle the tree themselves.
+func WithOrphanCleanup() ExecCmdOption {
+	return func(o *execCmdOptions) error {
+		o.orphanCleanup = true
 		return nil
 	}
 }
@@ -242,6 +257,12 @@ type ExecCmd struct {
 	gracePeriod            time.Duration
 	processTreeTermination bool
 	parentDeathCleanup     bool
+	orphanCleanup          bool
+	// treeTracked is true from the moment the reaper finds the direct child's
+	// tree still populated until the tree is first observed empty. Only a
+	// tracked tree may be signalled once the direct child has been reaped.
+	treeTracked bool
+	treeDone    chan struct{}
 	// onStart and onExit are read without holding mu: both are fixed at
 	// construction and never reassigned.
 	onStart  func(*ExecCmd)
@@ -385,6 +406,9 @@ func (p *Procman) NewExecCmdFromCmd(cmd *exec.Cmd, opts ...ExecCmdOption) (*Exec
 			return nil, err
 		}
 	}
+	if o.orphanCleanup && !o.processTreeTermination {
+		return nil, errors.New("WithOrphanCleanup requires WithProcessTreeTermination")
+	}
 	// exec.Cmd runs {Path} when Args is empty, so a literal &exec.Cmd{Path: p}
 	// is valid and must not be indexed.
 	name, args := cmd.Path, []string(nil)
@@ -400,9 +424,11 @@ func (p *Procman) NewExecCmdFromCmd(cmd *exec.Cmd, opts ...ExecCmdOption) (*Exec
 		cmd:                    cmd, // store now; Start() will use it
 		status:                 ExecCmdStatusNotStarted,
 		doneChan:               make(chan struct{}),
+		treeDone:               make(chan struct{}),
 		restartPolicy:          o.restartPolicy,
 		processTreeTermination: o.processTreeTermination,
 		parentDeathCleanup:     o.parentDeathCleanup,
+		orphanCleanup:          o.orphanCleanup,
 		gracePeriod:            o.gracePeriod,
 		onStart:                o.onStart,
 		onExit:                 o.onExit,
@@ -443,10 +469,11 @@ func (p *Procman) ListExecCmdes() []*ExecCmd {
 }
 
 // KillAll requests immediate, non-graceful termination of every running
-// command. It ignores termination errors and does not wait for process exit.
-// Commands that have already been reaped are skipped: their process ID, and
-// with WithProcessTreeTermination their process-group ID, may since have been
-// reused by an unrelated process.
+// command, and of what remains of the tree of every command whose direct child
+// has exited while its descendants are still tracked (see ExecCmd.TreeDone).
+// It ignores termination errors and does not wait for process exit. A command
+// whose tree has been observed empty is never signalled: its identifiers may
+// since have been reused by an unrelated process.
 func (p *Procman) KillAll() {
 	p.mu.RLock()
 	cmds := make([]*ExecCmd, 0, len(p.execCmds))
@@ -461,23 +488,29 @@ func (p *Procman) KillAll() {
 		if running {
 			child.stopRequested = true
 		}
+		tracked := child.treeTracked
 		child.mu.Unlock()
-		if running {
+		switch {
+		case running:
 			_ = forceKill(child)
+		case tracked:
+			_ = child.signalTrackedTree(false)
 		}
 	}
 }
 
 // StopAll gracefully stops all currently running commands concurrently and
-// waits for them to exit. It returns the joined errors from commands that fail
-// to stop. Registered commands that have not started are ignored.
+// waits for them to exit, as Stop does. It includes commands whose direct
+// child has exited while descendants are still tracked. It returns the joined
+// errors from commands that fail to stop. Registered commands that have not
+// started are ignored.
 func (p *Procman) StopAll() error {
 	cmds := p.ListExecCmdes()
 	errCh := make(chan error, len(cmds))
 	var waitGroup sync.WaitGroup
 
 	for _, cmd := range cmds {
-		if !cmd.IsRunning() {
+		if !cmd.needsStop() {
 			continue
 		}
 
@@ -585,7 +618,12 @@ func (c *ExecCmd) start() error {
 
 	go func() {
 		err := cmd.Wait()
-		cleanupExecCmd(c)
+		// Checked before Done closes, so that a tree with members left in it is
+		// tracked from the moment anything can observe the exit.
+		tracked := treeAlive(c)
+		if !tracked {
+			cleanupExecCmd(c)
+		}
 		c.mu.Lock()
 		if err != nil {
 			c.status = ExecCmdStatusFailed
@@ -594,6 +632,8 @@ func (c *ExecCmd) start() error {
 			c.status = ExecCmdStatusExited
 		}
 		c.exitedAt = time.Now()
+		c.treeTracked = tracked
+		exitedOnItsOwn := !c.stopRequested
 		c.mu.Unlock()
 		c.procman.notifyOnExit(c, err)
 		// Before the close, so that anything waiting on Done sees a command the
@@ -602,6 +642,14 @@ func (c *ExecCmd) start() error {
 			c.onExit(c, err)
 		}
 		close(c.doneChan)
+		if tracked {
+			if c.orphanCleanup && exitedOnItsOwn {
+				go func() { _ = c.Stop() }()
+			}
+			c.trackTree()
+			cleanupExecCmd(c)
+		}
+		close(c.treeDone)
 	}()
 	return nil
 }
@@ -671,11 +719,17 @@ func (c *ExecCmd) Wait() error {
 // grace period waits indefinitely after the graceful signal. Concurrent calls
 // share the same stop operation and result.
 //
-// With WithProcessTreeTermination and a positive grace period, Stop also waits
-// for the rest of the process tree: descendants still running when the direct
-// child exits get the remainder of the grace period, and are then killed. On
-// Unix this covers the command's process group. With a zero grace period Stop
-// returns once the direct child has been reaped.
+// With WithProcessTreeTermination and a positive grace period, Stop returns
+// only once the whole tree is gone: descendants still running when the direct
+// child exits get the remainder of the grace period, and are then killed. With
+// a zero grace period Stop does not wait for descendants.
+//
+// Stop also stops the descendants of a command whose direct child has already
+// exited, while that tree is still tracked (see TreeDone). They get the
+// graceful signal and the grace period on Unix; on Windows, where no graceful
+// signal can safely reach them once the direct child is gone, they are
+// terminated at once. StopRequested is not set in that case: the command itself
+// was not asked to stop.
 func (c *ExecCmd) Stop() error {
 	c.mu.Lock()
 	if !c.started || c.cmd == nil || c.cmd.Process == nil {
@@ -694,13 +748,16 @@ func (c *ExecCmd) Stop() error {
 		c.mu.RUnlock()
 		return err
 	}
-	if c.status != ExecCmdStatusRunning {
+	leaderRunning := c.status == ExecCmdStatusRunning
+	if !leaderRunning && !c.treeTracked {
 		c.mu.Unlock()
 		return nil
 	}
 	// Set only once the command is known to be alive, so that stopping something
 	// that has already died is not mistaken for having stopped it.
-	c.stopRequested = true
+	if leaderRunning {
+		c.stopRequested = true
+	}
 	doneChan := c.doneChan
 	c.stopping = true
 	c.stopDone = make(chan struct{})
@@ -714,6 +771,9 @@ func (c *ExecCmd) Stop() error {
 		close(stopDone)
 		c.mu.Unlock()
 		return err
+	}
+	if !leaderRunning {
+		return complete(c.stopTrackedTree(gracePeriod))
 	}
 
 	signalErr := gracefulSignal(c)
@@ -739,35 +799,102 @@ func (c *ExecCmd) Stop() error {
 			return complete(err)
 		}
 		<-doneChan
-		return complete(nil)
-	}
-	if !c.processTreeTermination {
+		// Forced termination covered the whole tree; wait for it to drain.
+		<-c.treeDone
 		return complete(nil)
 	}
 	// The direct child exited within the grace period, but descendants may have
 	// ignored the graceful signal. Give them what is left of it.
-	return complete(awaitTreeExit(c, timer.C))
+	return complete(c.awaitTree(timer.C))
 }
 
-// treePollInterval is how often Stop checks whether a process tree has emptied
-// after its direct child exited. No platform used here offers a notification.
-const treePollInterval = 20 * time.Millisecond
+// stopTrackedTree stops what remains of a tree whose direct child has already
+// been reaped, with the same escalation Stop applies to a running command.
+func (c *ExecCmd) stopTrackedTree(gracePeriod time.Duration) error {
+	if !gracefulTreeSignal {
+		if err := c.signalTrackedTree(false); err != nil {
+			return err
+		}
+		<-c.treeDone
+		return nil
+	}
+	if err := c.signalTrackedTree(true); err != nil {
+		return err
+	}
+	if gracePeriod <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(gracePeriod)
+	defer timer.Stop()
+	return c.awaitTree(timer.C)
+}
 
-// awaitTreeExit waits until no process remains in c's tree, or until deadline
-// fires, in which case it kills whatever remains. It stops checking at the
-// first observation of an empty tree, so it never acts on an identifier that
-// may since have been reused.
-func awaitTreeExit(c *ExecCmd, deadline <-chan time.Time) error {
+// awaitTree waits for TreeDone, killing what remains of the tree if deadline
+// fires first.
+func (c *ExecCmd) awaitTree(deadline <-chan time.Time) error {
+	select {
+	case <-c.treeDone:
+		return nil
+	case <-deadline:
+		if err := c.signalTrackedTree(false); err != nil {
+			return err
+		}
+		<-c.treeDone
+		return nil
+	}
+}
+
+// treePollInterval is how often a tracked tree is checked for remaining
+// members. Neither Unix process groups nor Windows Job Objects offer an exit
+// notification that does not also require being their parent.
+const treePollInterval = 50 * time.Millisecond
+
+// trackTree runs on the reaper goroutine once the direct child has been reaped
+// with members left in its tree, and returns when the tree is first observed
+// empty. An empty process group or Job Object cannot gain members again, so
+// that observation is final.
+func (c *ExecCmd) trackTree() {
 	ticker := time.NewTicker(treePollInterval)
 	defer ticker.Stop()
-	for treeAlive(c) {
-		select {
-		case <-deadline:
-			return forceKill(c)
-		case <-ticker.C:
+	for range ticker.C {
+		c.mu.Lock()
+		if c.treeTracked && treeAlive(c) {
+			c.mu.Unlock()
+			continue
 		}
+		c.treeTracked = false
+		c.mu.Unlock()
+		return
 	}
-	return nil
+}
+
+// signalTrackedTree signals what remains of the tree after the direct child
+// has been reaped. It acts only while the tree is tracked, and checks for
+// members again immediately before signalling, under the same lock that ends
+// tracking. The identifier it signals has therefore just been seen in use, and
+// on Unix POSIX does not reuse a process-group ID while the group has members.
+func (c *ExecCmd) signalTrackedTree(graceful bool) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.treeTracked {
+		return nil
+	}
+	if !treeAlive(c) {
+		c.treeTracked = false
+		return nil
+	}
+	return signalTree(c, graceful)
+}
+
+// needsStop reports whether Stop has anything to do: the direct child has not
+// been reaped, or it has but its tree is still tracked. The status, not the
+// operating system, decides the first: a direct child that has died while
+// Wait is still draining its output pipes is reported running until Wait
+// returns, and Stop is what reaches the descendants holding those pipes.
+func (c *ExecCmd) needsStop() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.started && (c.status == ExecCmdStatusRunning || c.treeTracked)
 }
 
 // GetProcessState returns the child's process state after it has been reaped.
@@ -787,6 +914,21 @@ func (c *ExecCmd) GetProcessState() *os.ProcessState {
 // call before Start; the channel simply stays open.
 func (c *ExecCmd) Done() <-chan struct{} {
 	return c.doneChan
+}
+
+// TreeDone returns a channel closed once the command has been reaped and no
+// process remains in its tree. It always closes after Done. With
+// WithProcessTreeTermination the tree is the command's process group on Unix
+// and its Job Object on Windows; descendants that left it are not counted.
+// Without that option, or when nothing outlives the direct child, it closes
+// immediately after Done.
+//
+// Between Done and TreeDone the leftover descendants are tracked: Stop,
+// StopAll, KillAll and Shutdown can still reach them, and WithOrphanCleanup
+// terminates them automatically. Tracking costs one check of the tree every
+// 50ms until it empties.
+func (c *ExecCmd) TreeDone() <-chan struct{} {
+	return c.treeDone
 }
 
 // ExitCode returns the platform exit status reported by os.ProcessState. It
