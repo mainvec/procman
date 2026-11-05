@@ -501,7 +501,9 @@ func (p *Procman) KillAll() {
 
 // StopAll gracefully stops all currently running commands concurrently and
 // waits for them to exit, as Stop does. It includes commands whose direct
-// child has exited while descendants are still tracked. It returns the joined
+// child has exited while descendants are still tracked, and skips a command
+// without process-tree termination whose direct child is already gone, even if
+// Wait is still draining its output pipes. It returns the joined
 // errors from commands that fail to stop. Registered commands that have not
 // started are ignored.
 func (p *Procman) StopAll() error {
@@ -886,15 +888,30 @@ func (c *ExecCmd) signalTrackedTree(graceful bool) error {
 	return signalTree(c, graceful)
 }
 
-// needsStop reports whether Stop has anything to do: the direct child has not
-// been reaped, or it has but its tree is still tracked. The status, not the
-// operating system, decides the first: a direct child that has died while
-// Wait is still draining its output pipes is reported running until Wait
-// returns, and Stop is what reaches the descendants holding those pipes.
+// needsStop reports whether Stop has anything to reach: the direct child, or
+// the tree it left behind while that is still tracked.
+//
+// A direct child that has died while Wait is still draining its output pipes
+// keeps the running status until Wait returns. With process-tree termination
+// the status decides, because Stop reaches the descendants holding those pipes
+// through the tree. Without it nothing can reach them: both signals find the
+// child already reaped and Stop would wait on Done for as long as they live,
+// so the operating system's view decides instead.
 func (c *ExecCmd) needsStop() bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.started && (c.status == ExecCmdStatusRunning || c.treeTracked)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch {
+	case !c.started:
+		return false
+	case c.treeTracked:
+		return true
+	case c.status != ExecCmdStatusRunning:
+		return false
+	case c.processTreeTermination:
+		return true
+	default:
+		return c.cmd != nil && c.cmd.Process != nil && processIsAlive(c.cmd.Process)
+	}
 }
 
 // GetProcessState returns the child's process state after it has been reaped.
