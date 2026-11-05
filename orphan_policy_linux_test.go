@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -123,4 +124,62 @@ func waitForLinuxProcessExit(t *testing.T, pid int) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("expected child %d to terminate after parent death", pid)
+}
+
+// Pdeathsig fires when the thread that forked the child exits, not when the
+// process does. A goroutine that locks its thread and returns makes Go
+// terminate that thread. A child forked on it would then be killed while the
+// procman-owning process is still running.
+func TestParentDeathCleanupSurvivesExitOfStartingThread(t *testing.T) {
+	pm := NewProcman()
+	t.Cleanup(func() { _ = pm.Shutdown() })
+
+	// Three, because one locked goroutine may land on the main thread, which Go
+	// parks instead of terminating.
+	var cmds []*ExecCmd
+	for range 3 {
+		cmd, err := pm.NewExecCmd("sleep", Args("30"), WithParentDeathCleanup())
+		if err != nil {
+			t.Fatalf("NewExecCmd: %v", err)
+		}
+		started := make(chan error, 1)
+		go func() {
+			runtime.LockOSThread() // never unlocked: the thread ends with the goroutine
+			started <- cmd.Start()
+		}()
+		if err := <-started; err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		cmds = append(cmds, cmd)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+	for i, cmd := range cmds {
+		if cmd.IsExited() {
+			t.Errorf("child %d was killed (exit code %d) when the thread that started it exited",
+				i, cmd.ExitCode())
+		}
+	}
+}
+
+func TestLockedThreadReturnsErrorsAndRepanicsOnTheCaller(t *testing.T) {
+	var thread lockedThread
+	want := errors.New("boom")
+	if err := thread.run(func() error { return want }); err != want {
+		t.Fatalf("run returned %v, want %v", err, want)
+	}
+
+	func() {
+		defer func() {
+			if r := recover(); r != "panicked" {
+				t.Fatalf("recovered %v, want the panic from fn", r)
+			}
+		}()
+		_ = thread.run(func() error { panic("panicked") })
+	}()
+
+	// The thread survives a panicking call.
+	if err := thread.run(func() error { return nil }); err != nil {
+		t.Fatalf("run after panic: %v", err)
+	}
 }

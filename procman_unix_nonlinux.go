@@ -11,3 +11,7 @@ func SupportsParentDeathCleanup() bool {
 func configureParentDeathSignal(child *ExecCmd) error {
 	return nil
 }
+
+func startProcess(child *ExecCmd) error {
+	return child.cmd.Start()
+}
