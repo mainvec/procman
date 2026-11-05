@@ -180,7 +180,8 @@ func processExists(pid int) bool {
 	}
 	if runtime.GOOS == "linux" {
 		stat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
-		if errors.Is(err, os.ErrNotExist) {
+		// ESRCH: reaped between opening the entry and reading it.
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
 			return false
 		}
 		if err == nil {
