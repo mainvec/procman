@@ -202,6 +202,46 @@ func TestShutdownReachesDescendantsHoldingOutputPipes(t *testing.T) {
 	awaitProcessGone(t, descendantPID)
 }
 
+// Without process-tree termination, procman cannot reach a descendant that
+// holds the command's output pipes, so StopAll must not wait for it.
+func TestStopAllSkipsNonTreeCommandWhoseDescendantHoldsOutputPipes(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "descendant.pid")
+	pm := procman.NewProcman()
+
+	native := exec.Command("/bin/sh", "-c", fmt.Sprintf(`sleep 60 & echo $! > %q`, pidFile))
+	var stdout bytes.Buffer
+	native.Stdout = &stdout
+	cmd, err := pm.NewExecCmdFromCmd(native, procman.WithGracePeriod(500*time.Millisecond))
+	if err != nil {
+		t.Fatalf("NewExecCmdFromCmd: %v", err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	descendantPID := waitForPIDFile(t, pidFile)
+	t.Cleanup(func() {
+		_ = syscall.Kill(descendantPID, syscall.SIGKILL)
+		<-cmd.Done()
+	})
+	awaitProcessGone(t, cmd.Pid())
+	select {
+	case <-cmd.Done():
+		t.Fatal("Done closed while a descendant still holds the output pipe")
+	default:
+	}
+
+	stopped := make(chan error, 1)
+	go func() { stopped <- pm.StopAll() }()
+	select {
+	case err := <-stopped:
+		if err != nil {
+			t.Fatalf("StopAll: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("StopAll waited on a non-tree command whose direct child is already gone")
+	}
+}
+
 func waitForPIDFile(t *testing.T, path string) int {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
