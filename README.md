@@ -256,6 +256,24 @@ Calling `Stop` before `Start` returns `procman.ErrExecCmdNotStarted`. Repeated
 concurrent calls wait for the same stop operation, including any wait for the
 process tree.
 
+`StopContext`, `StopAllContext`, and `ShutdownContext` bound the wait with a
+context. If the context ends first, procman forcibly terminates whatever is
+still running (the direct child, or the tracked tree it left behind) and
+returns an error wrapping `ctx.Err()`, without waiting for reaping:
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+if err := pm.ShutdownContext(ctx); errors.Is(err, context.DeadlineExceeded) {
+	log.Print("shutdown timed out; remaining processes were killed")
+}
+```
+
+A stop shared by concurrent callers is escalated for all of them when any one
+caller's context ends. Callers that are still waiting receive the final
+result. `Stop`, `StopAll`, and `Shutdown` are the same calls with
+`context.Background()`.
+
 Stop every currently running command concurrently:
 
 ```go
@@ -431,15 +449,13 @@ need application-specific shutdown mechanisms.
 
 Stopping and waiting:
 
-- `Stop`, `StopAll` and `Shutdown` take no timeout or context. With the default
-  zero grace period, a process that ignores the graceful signal keeps them
-  blocked; set `WithGracePeriod` to bound the wait.
 - The graceful signal is fixed: `SIGTERM` on Unix and `CTRL_BREAK_EVENT` on
   Windows. Windows console processes are the only Windows processes that receive
   it (see [Platform behavior](#platform-behavior)).
 - When `Stdout`/`Stderr` are writers, `Done` waits for every holder of the
   output pipes. Without process-tree termination, procman cannot reach holders
-  that outlive the direct child; set `exec.Cmd.WaitDelay` to bound the wait.
+  that outlive the direct child; set `exec.Cmd.WaitDelay` to bound the wait. A
+  context bounds the caller's wait, but cannot end those processes.
 
 Descendants:
 
