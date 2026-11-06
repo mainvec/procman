@@ -403,20 +403,39 @@ need application-specific shutdown mechanisms.
 
 ## Current limitations
 
-- Parent-death cleanup is opt-in and unsupported on non-Linux Unix platforms.
-- Linux parent-death cleanup covers only the direct child, not descendants.
-- Descendants that deliberately leave their process group or Windows Job Object
-	are outside procman's control.
-- Descendant tracking covers only the command's process group (Unix) or Job
-	Object (Windows). A descendant that leaves it is not tracked and not counted
-	by `TreeDone`.
-- Tracking polls; neither platform offers an exit notification for a process
-	group or job that procman is not the parent of.
-- On Windows, a child can start processes in the moment between its creation
-	and its assignment to the Job Object; those escape the job.
-- Restart policy options exist, but restart behavior is not implemented yet.
+Stopping and waiting:
+
+- `Stop`, `StopAll` and `Shutdown` take no timeout or context. With the default
+  zero grace period, a process that ignores the graceful signal keeps them
+  blocked; set `WithGracePeriod` to bound the wait.
+- The graceful signal is fixed: `SIGTERM` on Unix and `CTRL_BREAK_EVENT` on
+  Windows. Windows console processes are the only Windows processes that receive
+  it (see [Platform behavior](#platform-behavior)).
+- When `Stdout`/`Stderr` are writers, `Done` waits for every holder of the
+  output pipes. Without process-tree termination, procman cannot reach holders
+  that outlive the direct child; set `exec.Cmd.WaitDelay` to bound the wait.
+
+Descendants:
+
+- Without `WithProcessTreeTermination`, only the direct child is signalled.
+  Its descendants are neither stopped nor tracked.
+- With it, procman reaches only the command's process group (Unix) or Job
+  Object (Windows). A descendant that leaves it, by `setsid`, `setpgid` or
+  Job Object breakaway, is not stopped and not counted by `TreeDone`.
+- On Windows, a child can start processes between its creation and its
+  assignment to the Job Object; those escape the job.
+
+Parent-death cleanup:
+
+- It is opt-in, and unsupported on macOS and other non-Linux Unix platforms.
+- On Linux it kills only the direct child. Its descendants keep running.
+
+Registry:
+
+- Commands are never removed from the registry. Each one, with its `exec.Cmd`
+  and any output buffers that references, is kept for the life of the
+  `Procman`.
 
 ## TODO
 
-- Add an optional Unix watchdog for cleanup after unexpected parent exit.
-- Implement restart policies and backoff.
+- Add an optional Unix watchdog for cleanup after unexpected parent exit ([#27](https://github.com/mainvec/procman/issues/27)).
