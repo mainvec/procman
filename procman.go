@@ -21,6 +21,14 @@ var (
 	// ErrParentDeathCleanupUnsupported indicates that the current platform
 	// cannot provide native cleanup after the parent process exits.
 	ErrParentDeathCleanupUnsupported = errors.New("parent-death cleanup is unsupported on this platform")
+	// ErrExecCmdNotFound indicates that no registered command has the given ID.
+	ErrExecCmdNotFound = errors.New("child process not found")
+	// ErrExecCmdActive indicates that a command cannot be removed because its
+	// direct child is running or its process tree is still tracked.
+	ErrExecCmdActive = errors.New("child process still active")
+	// ErrExecCmdRemoved indicates that Start was called on a command that had
+	// been removed from its Procman before it started.
+	ErrExecCmdRemoved = errors.New("child process removed")
 )
 
 // ExecCmdOption configures a command managed by Procman.
@@ -31,6 +39,7 @@ type execCmdOptions struct {
 	processTreeTermination bool
 	parentDeathCleanup     bool
 	orphanCleanup          bool
+	autoRemove             bool
 	onStart                func(*ExecCmd)
 	onExit                 func(*ExecCmd, error)
 	// future fields: Env, Dir, Stdout, Stderr, etc.
@@ -90,6 +99,19 @@ func WithProcessTreeTermination() ExecCmdOption {
 func WithOrphanCleanup() ExecCmdOption {
 	return func(o *execCmdOptions) error {
 		o.orphanCleanup = true
+		return nil
+	}
+}
+
+// WithAutoRemove removes the command from its Procman's registry once it has
+// finished: after its direct child has been reaped and nothing is left in its
+// tree, just before TreeDone closes. Without it, finished commands stay
+// registered, with everything they reference, until Remove is called. Holders
+// of the *ExecCmd can still use it after removal. Procman.OnExit callbacks are
+// delivered asynchronously and may run after the command has been removed.
+func WithAutoRemove() ExecCmdOption {
+	return func(o *execCmdOptions) error {
+		o.autoRemove = true
 		return nil
 	}
 }
@@ -230,6 +252,10 @@ type ExecCmd struct {
 	processTreeTermination bool
 	parentDeathCleanup     bool
 	orphanCleanup          bool
+	autoRemove             bool
+	// removed is set once the command has left the registry. A removed command
+	// that never started cannot start: nothing would be able to stop it.
+	removed bool
 	// treeTracked is true from the moment the reaper finds the direct child's
 	// tree still populated until the tree is first observed empty. Only a
 	// tracked tree may be signalled once the direct child has been reaped.
@@ -398,6 +424,7 @@ func (p *Procman) NewExecCmdFromCmd(cmd *exec.Cmd, opts ...ExecCmdOption) (*Exec
 		processTreeTermination: o.processTreeTermination,
 		parentDeathCleanup:     o.parentDeathCleanup,
 		orphanCleanup:          o.orphanCleanup,
+		autoRemove:             o.autoRemove,
 		gracePeriod:            o.gracePeriod,
 		onStart:                o.onStart,
 		onExit:                 o.onExit,
@@ -419,14 +446,50 @@ func (p *Procman) GetExecCmd(id ID) (*ExecCmd, bool) {
 	return child, ok
 }
 
-func (p *Procman) removeExecCmd(id ID) {
+// Remove removes a finished or never-started command from the registry, so
+// that the Procman no longer retains it. A command is finished once TreeDone
+// has closed. Remove returns ErrExecCmdNotFound for an unknown ID, and
+// ErrExecCmdActive while the direct child runs or its tree is still tracked,
+// because StopAll, KillAll and Shutdown find commands through the registry. A
+// removed command that never started returns ErrExecCmdRemoved from Start.
+// Holders of the *ExecCmd can still read its state and channels.
+func (p *Procman) Remove(id ID) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	c, ok := p.execCmds[id]
+	if !ok {
+		return ErrExecCmdNotFound
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.started {
+		select {
+		case <-c.treeDone:
+		default:
+			return ErrExecCmdActive
+		}
+	}
+	c.removed = true
 	delete(p.execCmds, id)
+	return nil
+}
+
+// autoRemove is called by the reaper once the command has finished, before
+// TreeDone closes, so that anything observing TreeDone sees it removed.
+func (p *Procman) autoRemove(c *ExecCmd) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if p.execCmds[c.procmanId] == c {
+		delete(p.execCmds, c.procmanId)
+	}
+	c.removed = true
 }
 
 // ListExecCmdes returns a snapshot of all registered commands, including
-// commands that have not started and commands that have exited.
+// commands that have not started and finished commands that have not been
+// removed.
 func (p *Procman) ListExecCmdes() []*ExecCmd {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -556,6 +619,10 @@ func (c *ExecCmd) start() error {
 		c.mu.Unlock()
 		return ErrExecCmdAlreadyStarted
 	}
+	if c.removed {
+		c.mu.Unlock()
+		return ErrExecCmdRemoved
+	}
 	cmd := c.cmd
 	if err := prepareExecCmd(c); err != nil {
 		c.status = ExecCmdStatusFailed
@@ -619,6 +686,9 @@ func (c *ExecCmd) start() error {
 			}
 			c.trackTree()
 			cleanupExecCmd(c)
+		}
+		if c.autoRemove {
+			c.procman.autoRemove(c)
 		}
 		close(c.treeDone)
 	}()

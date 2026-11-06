@@ -381,6 +381,32 @@ cmds := pm.ListExecCmdes()
 `StopAll` ignores commands that have not started, and commands that have exited
 with nothing left in their tree.
 
+Finished commands stay registered, with their `exec.Cmd` and any output buffers
+it references, until they are removed. A long-running supervisor should remove
+them, either explicitly or automatically:
+
+```go
+// Explicitly, once the command has finished:
+<-cmd.TreeDone()
+err := pm.Remove(cmd.ID())
+
+// Or automatically, for one command or as a manager default:
+cmd, err := pm.NewExecCmd("worker", nil, procman.WithAutoRemove())
+pm, err := procman.NewProcmanWithOptions(
+	procman.WithDefaultExecCmdOptions(procman.WithAutoRemove()),
+)
+```
+
+A command has finished once `TreeDone` has closed. Until then `Remove` returns
+`procman.ErrExecCmdActive`, because `StopAll`, `KillAll`, and `Shutdown` find
+commands through the registry. `WithAutoRemove` removes the command just before
+`TreeDone` closes, after any `WithOnExit` callback. Asynchronous
+`Procman.OnExit` callbacks may run after removal.
+
+A command that is removed before it starts cannot be started: `Start` returns
+`procman.ErrExecCmdRemoved`. Existing references to a removed `*ExecCmd` keep
+working for reading its state and waiting on its channels.
+
 ## Platform behavior
 
 - Linux: `WithProcessTreeTermination` signals the process group during explicit
@@ -429,12 +455,6 @@ Parent-death cleanup:
 
 - It is opt-in, and unsupported on macOS and other non-Linux Unix platforms.
 - On Linux it kills only the direct child. Its descendants keep running.
-
-Registry:
-
-- Commands are never removed from the registry. Each one, with its `exec.Cmd`
-  and any output buffers that references, is kept for the life of the
-  `Procman`.
 
 ## TODO
 
