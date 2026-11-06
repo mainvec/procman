@@ -36,6 +36,10 @@ jobs:
       - name: Test
         run: go test ./... -count=1
 
+      - name: Spike #26 (Windows suspended start)
+        if: runner.os == 'Windows'
+        run: go test -run Spike -v -count=3 .
+
   race:
     name: Race detector
     runs-on: ubuntu-latest
