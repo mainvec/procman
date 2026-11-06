@@ -27,7 +27,6 @@ var (
 type ExecCmdOption func(*execCmdOptions) error
 
 type execCmdOptions struct {
-	restartPolicy          RestartPolicy
 	gracePeriod            time.Duration
 	processTreeTermination bool
 	parentDeathCleanup     bool
@@ -54,19 +53,6 @@ func WithDefaultExecCmdOptions(opts ...ExecCmdOption) ProcmanOption {
 				return err
 			}
 		}
-		return nil
-	}
-}
-
-// WithRestartPolicy selects the intended restart policy for a command.
-// Restart execution is not implemented yet.
-func WithRestartPolicy(p RestartPolicy) ExecCmdOption {
-	return func(o *execCmdOptions) error {
-		// validate
-		if p < RestartPolicyNever || p > RestartPolicyOnFailure {
-			return errors.New("invalid restart policy")
-		}
-		o.restartPolicy = p
 		return nil
 	}
 }
@@ -218,19 +204,6 @@ type event struct {
 	err  error
 }
 
-// RestartPolicy selects when a command should be restarted after exit.
-// Restart execution is not implemented yet.
-type RestartPolicy int
-
-const (
-	// RestartPolicyNever disables automatic restart.
-	RestartPolicyNever RestartPolicy = iota
-	// RestartPolicyAlways requests restart after every exit.
-	RestartPolicyAlways
-	// RestartPolicyOnFailure requests restart only after unsuccessful exit.
-	RestartPolicyOnFailure
-)
-
 // ExecCmd is a single-start handle to a child process managed by Procman.
 // Its methods are safe for concurrent use unless otherwise documented.
 type ExecCmd struct {
@@ -253,7 +226,6 @@ type ExecCmd struct {
 	doneChan               chan struct{}
 	stopDone               chan struct{}
 	stopErr                error
-	restartPolicy          RestartPolicy
 	gracePeriod            time.Duration
 	processTreeTermination bool
 	parentDeathCleanup     bool
@@ -272,16 +244,14 @@ type ExecCmd struct {
 
 // NewProcman creates a running Procman with default command behavior.
 func NewProcman() *Procman {
-	return newProcman(execCmdOptions{restartPolicy: RestartPolicyNever})
+	return newProcman(execCmdOptions{})
 }
 
 // NewProcmanWithOptions creates a running Procman with validated construction
 // options. It returns an error when a Procman option or default command option
 // is invalid or unsupported.
 func NewProcmanWithOptions(opts ...ProcmanOption) (*Procman, error) {
-	o := procmanOptions{
-		defaultExecCmdOptions: execCmdOptions{restartPolicy: RestartPolicyNever},
-	}
+	var o procmanOptions
 	for _, opt := range opts {
 		if err := opt(&o); err != nil {
 			return nil, err
@@ -425,7 +395,6 @@ func (p *Procman) NewExecCmdFromCmd(cmd *exec.Cmd, opts ...ExecCmdOption) (*Exec
 		status:                 ExecCmdStatusNotStarted,
 		doneChan:               make(chan struct{}),
 		treeDone:               make(chan struct{}),
-		restartPolicy:          o.restartPolicy,
 		processTreeTermination: o.processTreeTermination,
 		parentDeathCleanup:     o.parentDeathCleanup,
 		orphanCleanup:          o.orphanCleanup,

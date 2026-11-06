@@ -430,15 +430,12 @@ Parent-death cleanup:
 - It is opt-in, and unsupported on macOS and other non-Linux Unix platforms.
 - On Linux it kills only the direct child. Its descendants keep running.
 
-Registry and API:
+Registry:
 
 - Commands are never removed from the registry. Each one, with its `exec.Cmd`
   and any output buffers that references, is kept for the life of the
   `Procman`.
-- `WithRestartPolicy` is accepted but ignored: procman never restarts a
-  command.
 
 ## TODO
 
-- Add an optional Unix watchdog for cleanup after unexpected parent exit.
-- Implement restart policies and backoff.
+- Add an optional Unix watchdog for cleanup after unexpected parent exit ([#27](https://github.com/mainvec/procman/issues/27)).
