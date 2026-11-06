@@ -55,7 +55,7 @@ Branches are named after the issue:
 Follow [Conventional Commits][conventional-commits] and reference the issue:
 
 ```
-feat: add restart policy support (#42)
+feat: add context-aware stop (#42)
 fix: handle nil process state on windows (#42)
 perf: reduce event loop allocations (#42)
 chore: update dependencies (#42)

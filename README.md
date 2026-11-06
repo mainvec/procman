@@ -256,6 +256,39 @@ Calling `Stop` before `Start` returns `procman.ErrExecCmdNotStarted`. Repeated
 concurrent calls wait for the same stop operation, including any wait for the
 process tree.
 
+On Unix the graceful signal is `SIGTERM`. `WithStopSignal` chooses another,
+for programs that expect, say, `SIGINT` or `SIGHUP`. With process-tree
+termination it goes to the whole process group. Forced termination is still
+`SIGKILL`, and `SIGKILL` and `SIGSTOP` are rejected as stop signals. On
+Windows the option fails with `procman.ErrStopSignalUnsupported`, because
+`CTRL_BREAK_EVENT` is the only console event that can be sent to a process
+group.
+
+```go
+cmd, err := pm.NewExecCmd("server", nil,
+	procman.WithStopSignal(syscall.SIGINT),
+	procman.WithGracePeriod(10*time.Second),
+)
+```
+
+`StopContext`, `StopAllContext`, and `ShutdownContext` bound the wait with a
+context. If the context ends first, procman forcibly terminates whatever is
+still running (the direct child, or the tracked tree it left behind) and
+returns an error wrapping `ctx.Err()`, without waiting for reaping:
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+if err := pm.ShutdownContext(ctx); errors.Is(err, context.DeadlineExceeded) {
+	log.Print("shutdown timed out; remaining processes were killed")
+}
+```
+
+A stop shared by concurrent callers is escalated for all of them when any one
+caller's context ends. Callers that are still waiting receive the final
+result. `Stop`, `StopAll`, and `Shutdown` are the same calls with
+`context.Background()`.
+
 Stop every currently running command concurrently:
 
 ```go
@@ -381,6 +414,32 @@ cmds := pm.ListExecCmdes()
 `StopAll` ignores commands that have not started, and commands that have exited
 with nothing left in their tree.
 
+Finished commands stay registered, with their `exec.Cmd` and any output buffers
+it references, until they are removed. A long-running supervisor should remove
+them, either explicitly or automatically:
+
+```go
+// Explicitly, once the command has finished:
+<-cmd.TreeDone()
+err := pm.Remove(cmd.ID())
+
+// Or automatically, for one command or as a manager default:
+cmd, err := pm.NewExecCmd("worker", nil, procman.WithAutoRemove())
+pm, err := procman.NewProcmanWithOptions(
+	procman.WithDefaultExecCmdOptions(procman.WithAutoRemove()),
+)
+```
+
+A command has finished once `TreeDone` has closed. Until then `Remove` returns
+`procman.ErrExecCmdActive`, because `StopAll`, `KillAll`, and `Shutdown` find
+commands through the registry. `WithAutoRemove` removes the command just before
+`TreeDone` closes, after any `WithOnExit` callback. Asynchronous
+`Procman.OnExit` callbacks may run after removal.
+
+A command that is removed before it starts cannot be started: `Start` returns
+`procman.ErrExecCmdRemoved`. Existing references to a removed `*ExecCmd` keep
+working for reading its state and waiting on its channels.
+
 ## Platform behavior
 
 - Linux: `WithProcessTreeTermination` signals the process group during explicit
@@ -403,20 +462,30 @@ need application-specific shutdown mechanisms.
 
 ## Current limitations
 
-- Parent-death cleanup is opt-in and unsupported on non-Linux Unix platforms.
-- Linux parent-death cleanup covers only the direct child, not descendants.
-- Descendants that deliberately leave their process group or Windows Job Object
-	are outside procman's control.
-- Descendant tracking covers only the command's process group (Unix) or Job
-	Object (Windows). A descendant that leaves it is not tracked and not counted
-	by `TreeDone`.
-- Tracking polls; neither platform offers an exit notification for a process
-	group or job that procman is not the parent of.
-- On Windows, a child can start processes in the moment between its creation
-	and its assignment to the Job Object; those escape the job.
-- Restart policy options exist, but restart behavior is not implemented yet.
+Stopping and waiting:
+
+- On Windows the graceful signal is always `CTRL_BREAK_EVENT`, and only
+  console processes receive it (see [Platform behavior](#platform-behavior)).
+- When `Stdout`/`Stderr` are writers, `Done` waits for every holder of the
+  output pipes. Without process-tree termination, procman cannot reach holders
+  that outlive the direct child; set `exec.Cmd.WaitDelay` to bound the wait. A
+  context bounds the caller's wait, but cannot end those processes.
+
+Descendants:
+
+- Without `WithProcessTreeTermination`, only the direct child is signalled.
+  Its descendants are neither stopped nor tracked.
+- With it, procman reaches only the command's process group (Unix) or Job
+  Object (Windows). A descendant that leaves it, by `setsid`, `setpgid` or
+  Job Object breakaway, is not stopped and not counted by `TreeDone`.
+- On Windows, a child can start processes between its creation and its
+  assignment to the Job Object; those escape the job.
+
+Parent-death cleanup:
+
+- It is opt-in, and unsupported on macOS and other non-Linux Unix platforms.
+- On Linux it kills only the direct child. Its descendants keep running.
 
 ## TODO
 
-- Add an optional Unix watchdog for cleanup after unexpected parent exit.
-- Implement restart policies and backoff.
+- Add an optional Unix watchdog for cleanup after unexpected parent exit ([#27](https://github.com/mainvec/procman/issues/27)).

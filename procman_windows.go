@@ -56,6 +56,10 @@ func prepareExecCmd(child *ExecCmd) error {
 	return nil
 }
 
+func validateStopSignal(syscall.Signal) error {
+	return ErrStopSignalUnsupported
+}
+
 func startProcess(child *ExecCmd) error {
 	return child.cmd.Start()
 }

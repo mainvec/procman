@@ -5,10 +5,12 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"os/signal"
 	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -20,6 +22,7 @@ const (
 	testPrintArgv0Mode = "--procman-print-argv0"
 	testExitMode       = "--procman-exit"
 	testSpawnMode      = "--procman-spawn-sleeper"
+	testIgnoreStopMode = "--procman-ignore-stop"
 )
 
 func init() {
@@ -57,6 +60,21 @@ func init() {
 		if len(os.Args) > 3 {
 			_ = os.WriteFile(os.Args[3], []byte(strconv.Itoa(child.Process.Pid)), 0o600)
 		}
+		os.Exit(0)
+	case testIgnoreStopMode:
+		// Receive the graceful stop signal and carry on. Notify, not Ignore: on
+		// Windows an ignored CTRL_BREAK_EVENT is reported as unhandled, and the
+		// system then terminates the process.
+		signal.Notify(make(chan os.Signal, 1), os.Interrupt, syscall.SIGTERM)
+		seconds, err := strconv.Atoi(os.Args[2])
+		if err != nil {
+			os.Exit(2)
+		}
+		if len(os.Args) > 3 {
+			// Readiness: the handler is installed.
+			_ = os.WriteFile(os.Args[3], []byte("ready"), 0o600)
+		}
+		time.Sleep(time.Duration(seconds) * time.Second)
 		os.Exit(0)
 	case testPrintArgv0Mode:
 		_, _ = os.Stdout.WriteString(os.Args[0])

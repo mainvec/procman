@@ -5,6 +5,8 @@
 // every started child, and dispatches asynchronous start and exit callbacks.
 // Stop and StopAll perform graceful shutdown with optional forced escalation.
 // Shutdown additionally prevents new work and closes the event loop.
+// StopContext, StopAllContext and ShutdownContext bound the wait: when the
+// context ends first, whatever is still running is forcibly terminated.
 //
 // Process-tree termination and cleanup after an unexpected parent exit are
 // opt-in capabilities with platform-specific implementations. Use
