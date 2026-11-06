@@ -4,9 +4,23 @@ package procman
 
 import (
 	"os/exec"
+	"strconv"
+	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
+
+// isZombie reports whether pid has died but not been reaped, using ps, which
+// both Linux and macOS provide.
+func isZombie(t *testing.T, pid int) bool {
+	t.Helper()
+	out, err := exec.Command("ps", "-o", "stat=", "-p", strconv.Itoa(pid)).Output()
+	if err != nil {
+		return false
+	}
+	return strings.HasPrefix(strings.TrimSpace(string(out)), "Z")
+}
 
 func TestSignalsAfterReapAreNotErrors(t *testing.T) {
 	pm := NewProcman()
@@ -30,6 +44,38 @@ func TestSignalsAfterReapAreNotErrors(t *testing.T) {
 	}
 	if err := forceKill(cmd); err != nil {
 		t.Errorf("forceKill after reap: %v", err)
+	}
+}
+
+// A killed group whose leader has not been reaped yet consists only of zombies.
+// macOS answers EPERM to signals for such a group; that is not a failure.
+func TestSignalProcessGroupOfZombiesIsNotAnError(t *testing.T) {
+	cmd := exec.Command("sleep", "30")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	pid := cmd.Process.Pid
+	t.Cleanup(func() { _ = cmd.Wait() })
+	if err := signalProcessGroup(pid, syscall.SIGKILL); err != nil {
+		t.Fatalf("signalProcessGroup(live group): %v", err)
+	}
+	// Leave it unreaped until it has died.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if isZombie(t, pid) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("process did not die")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := signalProcessGroup(pid, syscall.SIGKILL); err != nil {
+		t.Errorf("signalProcessGroup(zombie-only group) = %v, want nil", err)
+	}
+	if err := signalProcessGroup(pid, syscall.SIGTERM); err != nil {
+		t.Errorf("signalProcessGroup(zombie-only group, SIGTERM) = %v, want nil", err)
 	}
 }
 

@@ -16,6 +16,9 @@ import (
 type platformState struct {
 	mu  sync.Mutex
 	job windows.Handle
+	// resume is set when procman, not the caller, created the child suspended,
+	// and so must resume it once it is in its Job Object.
+	resume bool
 }
 
 // SupportsParentDeathCleanup reports whether native parent-death cleanup is
@@ -50,10 +53,20 @@ func prepareExecCmd(child *ExecCmd) error {
 		windows.CloseHandle(job)
 		return fmt.Errorf("configure Job Object: %w", err)
 	}
+	// Created suspended, the child runs nothing, and so starts no process,
+	// until finishExecCmdStart has assigned it to the job. A caller that asked
+	// for a suspended child resumes it itself.
+	resume := child.cmd.SysProcAttr.CreationFlags&windows.CREATE_SUSPENDED == 0
+	child.cmd.SysProcAttr.CreationFlags |= windows.CREATE_SUSPENDED
 	child.platform.mu.Lock()
 	child.platform.job = job
+	child.platform.resume = resume
 	child.platform.mu.Unlock()
 	return nil
+}
+
+func validateStopSignal(syscall.Signal) error {
+	return ErrStopSignalUnsupported
 }
 
 func startProcess(child *ExecCmd) error {
@@ -75,8 +88,59 @@ func finishExecCmdStart(child *ExecCmd) error {
 		return fmt.Errorf("open process for Job Object: %w", err)
 	}
 	defer windows.CloseHandle(process)
+	if afterStartHook != nil {
+		afterStartHook()
+	}
 	if err := windows.AssignProcessToJobObject(child.platform.job, process); err != nil {
 		return fmt.Errorf("assign process to Job Object: %w", err)
+	}
+	if child.platform.resume {
+		if err := resumeProcess(child.cmd.Process.Pid); err != nil {
+			return fmt.Errorf("resume process: %w", err)
+		}
+	}
+	return nil
+}
+
+// afterStartHook, when set by a test, runs between process creation and Job
+// Object assignment, to widen the window a child could otherwise use to start
+// processes outside the job.
+var afterStartHook func()
+
+// resumeProcess resumes every thread of a process created suspended: just its
+// initial thread. os/exec closes the thread handle that CreateProcess returns,
+// so the thread is found through a Toolhelp snapshot. The snapshot lists every
+// thread on the system, which makes this the costly part of a start with a Job
+// Object (about 10ms on a machine with 1,500 threads), but it uses only
+// documented APIs, unlike NtResumeProcess.
+func resumeProcess(pid int) error {
+	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPTHREAD, 0)
+	if err != nil {
+		return fmt.Errorf("thread snapshot: %w", err)
+	}
+	defer windows.CloseHandle(snap)
+	resumed := 0
+	entry := windows.ThreadEntry32{Size: uint32(unsafe.Sizeof(windows.ThreadEntry32{}))}
+	for err = windows.Thread32First(snap, &entry); err == nil; err = windows.Thread32Next(snap, &entry) {
+		if entry.OwnerProcessID != uint32(pid) {
+			continue
+		}
+		thread, err := windows.OpenThread(windows.THREAD_SUSPEND_RESUME, false, entry.ThreadID)
+		if err != nil {
+			return fmt.Errorf("open thread %d: %w", entry.ThreadID, err)
+		}
+		_, err = windows.ResumeThread(thread)
+		windows.CloseHandle(thread)
+		if err != nil {
+			return fmt.Errorf("resume thread %d: %w", entry.ThreadID, err)
+		}
+		resumed++
+	}
+	if !errors.Is(err, windows.ERROR_NO_MORE_FILES) {
+		return fmt.Errorf("walk thread snapshot: %w", err)
+	}
+	if resumed == 0 {
+		return fmt.Errorf("no threads found for process %d", pid)
 	}
 	return nil
 }
