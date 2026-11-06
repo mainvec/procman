@@ -1,7 +1,9 @@
 package procman
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -21,17 +23,25 @@ var (
 	// ErrParentDeathCleanupUnsupported indicates that the current platform
 	// cannot provide native cleanup after the parent process exits.
 	ErrParentDeathCleanupUnsupported = errors.New("parent-death cleanup is unsupported on this platform")
+	// ErrExecCmdNotFound indicates that no registered command has the given ID.
+	ErrExecCmdNotFound = errors.New("child process not found")
+	// ErrExecCmdActive indicates that a command cannot be removed because its
+	// direct child is running or its process tree is still tracked.
+	ErrExecCmdActive = errors.New("child process still active")
+	// ErrExecCmdRemoved indicates that Start was called on a command that had
+	// been removed from its Procman before it started.
+	ErrExecCmdRemoved = errors.New("child process removed")
 )
 
 // ExecCmdOption configures a command managed by Procman.
 type ExecCmdOption func(*execCmdOptions) error
 
 type execCmdOptions struct {
-	restartPolicy          RestartPolicy
 	gracePeriod            time.Duration
 	processTreeTermination bool
 	parentDeathCleanup     bool
 	orphanCleanup          bool
+	autoRemove             bool
 	onStart                func(*ExecCmd)
 	onExit                 func(*ExecCmd, error)
 	// future fields: Env, Dir, Stdout, Stderr, etc.
@@ -54,19 +64,6 @@ func WithDefaultExecCmdOptions(opts ...ExecCmdOption) ProcmanOption {
 				return err
 			}
 		}
-		return nil
-	}
-}
-
-// WithRestartPolicy selects the intended restart policy for a command.
-// Restart execution is not implemented yet.
-func WithRestartPolicy(p RestartPolicy) ExecCmdOption {
-	return func(o *execCmdOptions) error {
-		// validate
-		if p < RestartPolicyNever || p > RestartPolicyOnFailure {
-			return errors.New("invalid restart policy")
-		}
-		o.restartPolicy = p
 		return nil
 	}
 }
@@ -104,6 +101,19 @@ func WithProcessTreeTermination() ExecCmdOption {
 func WithOrphanCleanup() ExecCmdOption {
 	return func(o *execCmdOptions) error {
 		o.orphanCleanup = true
+		return nil
+	}
+}
+
+// WithAutoRemove removes the command from its Procman's registry once it has
+// finished: after its direct child has been reaped and nothing is left in its
+// tree, just before TreeDone closes. Without it, finished commands stay
+// registered, with everything they reference, until Remove is called. Holders
+// of the *ExecCmd can still use it after removal. Procman.OnExit callbacks are
+// delivered asynchronously and may run after the command has been removed.
+func WithAutoRemove() ExecCmdOption {
+	return func(o *execCmdOptions) error {
+		o.autoRemove = true
 		return nil
 	}
 }
@@ -210,6 +220,11 @@ type Procman struct {
 	status       ProcmanStatus
 	shutdownOnce sync.Once
 	shutdownErr  error
+	// shutdownDone closes when the shutdown run has finished. shutdownCancel
+	// escalates that run to forced termination. Both are set inside
+	// shutdownOnce.
+	shutdownDone   chan struct{}
+	shutdownCancel context.CancelFunc
 }
 
 type event struct {
@@ -217,19 +232,6 @@ type event struct {
 	ecmd *ExecCmd
 	err  error
 }
-
-// RestartPolicy selects when a command should be restarted after exit.
-// Restart execution is not implemented yet.
-type RestartPolicy int
-
-const (
-	// RestartPolicyNever disables automatic restart.
-	RestartPolicyNever RestartPolicy = iota
-	// RestartPolicyAlways requests restart after every exit.
-	RestartPolicyAlways
-	// RestartPolicyOnFailure requests restart only after unsuccessful exit.
-	RestartPolicyOnFailure
-)
 
 // ExecCmd is a single-start handle to a child process managed by Procman.
 // Its methods are safe for concurrent use unless otherwise documented.
@@ -253,11 +255,14 @@ type ExecCmd struct {
 	doneChan               chan struct{}
 	stopDone               chan struct{}
 	stopErr                error
-	restartPolicy          RestartPolicy
 	gracePeriod            time.Duration
 	processTreeTermination bool
 	parentDeathCleanup     bool
 	orphanCleanup          bool
+	autoRemove             bool
+	// removed is set once the command has left the registry. A removed command
+	// that never started cannot start: nothing would be able to stop it.
+	removed bool
 	// treeTracked is true from the moment the reaper finds the direct child's
 	// tree still populated until the tree is first observed empty. Only a
 	// tracked tree may be signalled once the direct child has been reaped.
@@ -272,16 +277,14 @@ type ExecCmd struct {
 
 // NewProcman creates a running Procman with default command behavior.
 func NewProcman() *Procman {
-	return newProcman(execCmdOptions{restartPolicy: RestartPolicyNever})
+	return newProcman(execCmdOptions{})
 }
 
 // NewProcmanWithOptions creates a running Procman with validated construction
 // options. It returns an error when a Procman option or default command option
 // is invalid or unsupported.
 func NewProcmanWithOptions(opts ...ProcmanOption) (*Procman, error) {
-	o := procmanOptions{
-		defaultExecCmdOptions: execCmdOptions{restartPolicy: RestartPolicyNever},
-	}
+	var o procmanOptions
 	for _, opt := range opts {
 		if err := opt(&o); err != nil {
 			return nil, err
@@ -425,10 +428,10 @@ func (p *Procman) NewExecCmdFromCmd(cmd *exec.Cmd, opts ...ExecCmdOption) (*Exec
 		status:                 ExecCmdStatusNotStarted,
 		doneChan:               make(chan struct{}),
 		treeDone:               make(chan struct{}),
-		restartPolicy:          o.restartPolicy,
 		processTreeTermination: o.processTreeTermination,
 		parentDeathCleanup:     o.parentDeathCleanup,
 		orphanCleanup:          o.orphanCleanup,
+		autoRemove:             o.autoRemove,
 		gracePeriod:            o.gracePeriod,
 		onStart:                o.onStart,
 		onExit:                 o.onExit,
@@ -450,14 +453,50 @@ func (p *Procman) GetExecCmd(id ID) (*ExecCmd, bool) {
 	return child, ok
 }
 
-func (p *Procman) removeExecCmd(id ID) {
+// Remove removes a finished or never-started command from the registry, so
+// that the Procman no longer retains it. A command is finished once TreeDone
+// has closed. Remove returns ErrExecCmdNotFound for an unknown ID, and
+// ErrExecCmdActive while the direct child runs or its tree is still tracked,
+// because StopAll, KillAll and Shutdown find commands through the registry. A
+// removed command that never started returns ErrExecCmdRemoved from Start.
+// Holders of the *ExecCmd can still read its state and channels.
+func (p *Procman) Remove(id ID) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	c, ok := p.execCmds[id]
+	if !ok {
+		return ErrExecCmdNotFound
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.started {
+		select {
+		case <-c.treeDone:
+		default:
+			return ErrExecCmdActive
+		}
+	}
+	c.removed = true
 	delete(p.execCmds, id)
+	return nil
+}
+
+// autoRemove is called by the reaper once the command has finished, before
+// TreeDone closes, so that anything observing TreeDone sees it removed.
+func (p *Procman) autoRemove(c *ExecCmd) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if p.execCmds[c.procmanId] == c {
+		delete(p.execCmds, c.procmanId)
+	}
+	c.removed = true
 }
 
 // ListExecCmdes returns a snapshot of all registered commands, including
-// commands that have not started and commands that have exited.
+// commands that have not started and finished commands that have not been
+// removed.
 func (p *Procman) ListExecCmdes() []*ExecCmd {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -482,21 +521,28 @@ func (p *Procman) KillAll() {
 	}
 	p.mu.RUnlock()
 	for _, child := range cmds {
-		child.mu.Lock()
-		running := child.started && child.cmd != nil && child.cmd.Process != nil &&
-			child.status == ExecCmdStatusRunning
-		if running {
-			child.stopRequested = true
-		}
-		tracked := child.treeTracked
-		child.mu.Unlock()
-		switch {
-		case running:
-			_ = forceKill(child)
-		case tracked:
-			_ = child.signalTrackedTree(false)
-		}
+		_ = child.kill()
 	}
+}
+
+// kill forcibly terminates the command if its direct child is still running,
+// or what remains of its tree while that is tracked. It does not wait.
+func (c *ExecCmd) kill() error {
+	c.mu.Lock()
+	running := c.started && c.cmd != nil && c.cmd.Process != nil &&
+		c.status == ExecCmdStatusRunning
+	if running {
+		c.stopRequested = true
+	}
+	tracked := c.treeTracked
+	c.mu.Unlock()
+	switch {
+	case running:
+		return forceKill(c)
+	case tracked:
+		return c.signalTrackedTree(false)
+	}
+	return nil
 }
 
 // StopAll gracefully stops all currently running commands concurrently and
@@ -505,54 +551,111 @@ func (p *Procman) KillAll() {
 // without process-tree termination whose direct child is already gone, even if
 // Wait is still draining its output pipes. It returns the joined
 // errors from commands that fail to stop. Registered commands that have not
-// started are ignored.
+// started are ignored. It is StopAllContext with context.Background.
 func (p *Procman) StopAll() error {
-	cmds := p.ListExecCmdes()
-	errCh := make(chan error, len(cmds))
-	var waitGroup sync.WaitGroup
+	return p.StopAllContext(context.Background())
+}
 
+// StopAllContext is StopAll bounded by ctx. If ctx ends first, every stop
+// still in progress is escalated as StopContext describes, and the result
+// wraps ctx.Err() once, joined with any other stop errors.
+func (p *Procman) StopAllContext(ctx context.Context) error {
+	errs, abandoned := p.stopAll(ctx)
+	if abandoned {
+		errs = append([]error{abandonedError("stop", ctx)}, errs...)
+	}
+	return errors.Join(errs...)
+}
+
+// stopAll stops every command that needs it and reports their errors, apart
+// from ctx ending, which it reports separately.
+func (p *Procman) stopAll(ctx context.Context) (errs []error, abandoned bool) {
+	cmds := p.ListExecCmdes()
+	var (
+		mu        sync.Mutex
+		waitGroup sync.WaitGroup
+	)
 	for _, cmd := range cmds {
 		if !cmd.needsStop() {
 			continue
 		}
-
 		waitGroup.Add(1)
 		go func() {
 			defer waitGroup.Done()
-			if err := cmd.Stop(); err != nil {
-				errCh <- err
+			cmdAbandoned, err := cmd.stop(ctx)
+			mu.Lock()
+			defer mu.Unlock()
+			abandoned = abandoned || cmdAbandoned
+			if err != nil {
+				errs = append(errs, err)
 			}
 		}()
 	}
-
 	waitGroup.Wait()
-	close(errCh)
-	errs := make([]error, 0, len(errCh))
-	for err := range errCh {
-		errs = append(errs, err)
-	}
-	return errors.Join(errs...)
+	return errs, abandoned
 }
 
 // Shutdown prevents new commands from being created or started, stops running
 // commands, waits for started commands to be reaped, drains callbacks, and
 // stops the event loop. Concurrent and repeated calls return the same result.
+// It is ShutdownContext with context.Background.
 func (p *Procman) Shutdown() error {
+	return p.ShutdownContext(context.Background())
+}
+
+// ShutdownContext is Shutdown bounded by ctx. The manager stops accepting
+// commands at once, and a single shutdown run proceeds as Shutdown describes,
+// whichever call started it. Each call waits for that run or for its own ctx.
+// If ctx ends first, the run is escalated: every command still running and
+// every tracked tree is forcibly terminated before ShutdownContext returns an
+// error wrapping ctx.Err(). It does not wait for those processes to be reaped.
+// The run itself carries on in the background, and a later call, such as
+// Shutdown, can wait for it to finish and return its result.
+func (p *Procman) ShutdownContext(ctx context.Context) error {
 	p.shutdownOnce.Do(func() {
 		p.mu.Lock()
 		p.status = ProcmanStatusShutdown
 		p.mu.Unlock()
-
-		p.shutdownErr = p.StopAll()
-		for _, cmd := range p.ListExecCmdes() {
-			if cmd.IsStarted() {
-				<-cmd.doneChan
-			}
-		}
-		p.WaitEventLoop()
-		p.StopEventLoop()
+		runCtx, cancel := context.WithCancel(context.Background())
+		p.shutdownCancel = cancel
+		p.shutdownDone = make(chan struct{})
+		go p.runShutdown(runCtx)
 	})
-	return p.shutdownErr
+	select {
+	case <-p.shutdownDone:
+		return p.shutdownErr
+	case <-ctx.Done():
+	}
+	select {
+	case <-p.shutdownDone:
+		return p.shutdownErr
+	default:
+	}
+	p.shutdownCancel()
+	// Synchronously, so that every kill has been sent when this returns; the
+	// cancelled run escalates its own stops too, but on other goroutines.
+	p.KillAll()
+	return abandonedError("shutdown", ctx)
+}
+
+func (p *Procman) runShutdown(ctx context.Context) {
+	defer close(p.shutdownDone)
+	defer p.shutdownCancel()
+	// An escalation is reported to the caller whose context ended, not as the
+	// run's result.
+	errs, _ := p.stopAll(ctx)
+	p.shutdownErr = errors.Join(errs...)
+	for _, cmd := range p.ListExecCmdes() {
+		if cmd.IsStarted() {
+			<-cmd.doneChan
+		}
+	}
+	p.WaitEventLoop()
+	p.StopEventLoop()
+}
+
+func abandonedError(op string, ctx context.Context) error {
+	return fmt.Errorf("%s did not complete: %w", op, ctx.Err())
 }
 
 // ID returns the identifier assigned when the command was registered.
@@ -586,6 +689,10 @@ func (c *ExecCmd) start() error {
 	if c.started {
 		c.mu.Unlock()
 		return ErrExecCmdAlreadyStarted
+	}
+	if c.removed {
+		c.mu.Unlock()
+		return ErrExecCmdRemoved
 	}
 	cmd := c.cmd
 	if err := prepareExecCmd(c); err != nil {
@@ -650,6 +757,9 @@ func (c *ExecCmd) start() error {
 			}
 			c.trackTree()
 			cleanupExecCmd(c)
+		}
+		if c.autoRemove {
+			c.procman.autoRemove(c)
 		}
 		close(c.treeDone)
 	}()
@@ -732,64 +842,109 @@ func (c *ExecCmd) Wait() error {
 // signal can safely reach them once the direct child is gone, they are
 // terminated at once. StopRequested is not set in that case: the command itself
 // was not asked to stop.
+//
+// Stop is StopContext with context.Background.
 func (c *ExecCmd) Stop() error {
+	return c.StopContext(context.Background())
+}
+
+// StopContext is Stop bounded by ctx. If ctx ends before the stop completes,
+// StopContext forcibly terminates the command, and its tree while that is
+// tracked, then returns an error wrapping ctx.Err() without waiting for them
+// to be reaped. A stop shared with concurrent callers is escalated for all of
+// them; a caller still waiting receives the stop's final result.
+func (c *ExecCmd) StopContext(ctx context.Context) error {
+	abandoned, err := c.stop(ctx)
+	if abandoned {
+		return errors.Join(abandonedError("stop", ctx), err)
+	}
+	return err
+}
+
+// stop runs or joins the command's stop operation and waits for it or for ctx.
+// When ctx ends first it kills the command, reports abandoned, and returns
+// only the kill's error.
+func (c *ExecCmd) stop(ctx context.Context) (abandoned bool, err error) {
 	c.mu.Lock()
 	if !c.started || c.cmd == nil || c.cmd.Process == nil {
 		c.mu.Unlock()
-		return ErrExecCmdNotStarted
+		return false, ErrExecCmdNotStarted
 	}
 	// Checked before status: the direct child may already be reaped while a stop
 	// is still waiting for the rest of its process tree, and a concurrent caller
 	// must share that wait rather than return early.
-	if c.stopping {
-		stopDone := c.stopDone
-		c.mu.Unlock()
-		<-stopDone
-		c.mu.RLock()
-		err := c.stopErr
-		c.mu.RUnlock()
-		return err
+	if !c.stopping {
+		leaderRunning := c.status == ExecCmdStatusRunning
+		if !leaderRunning && !c.treeTracked {
+			c.mu.Unlock()
+			return false, nil
+		}
+		// Set only once the command is known to be alive, so that stopping
+		// something that has already died is not mistaken for having stopped it.
+		if leaderRunning {
+			c.stopRequested = true
+		}
+		c.stopping = true
+		c.stopDone = make(chan struct{})
+		// On its own goroutine, so that a caller whose context ends can leave it.
+		go c.runStop(leaderRunning, c.doneChan, c.stopDone, c.gracePeriod)
 	}
-	leaderRunning := c.status == ExecCmdStatusRunning
-	if !leaderRunning && !c.treeTracked {
-		c.mu.Unlock()
-		return nil
-	}
-	// Set only once the command is known to be alive, so that stopping something
-	// that has already died is not mistaken for having stopped it.
-	if leaderRunning {
-		c.stopRequested = true
-	}
-	doneChan := c.doneChan
-	c.stopping = true
-	c.stopDone = make(chan struct{})
 	stopDone := c.stopDone
-	gracePeriod := c.gracePeriod
 	c.mu.Unlock()
-	complete := func(err error) error {
-		c.mu.Lock()
-		c.stopErr = err
-		c.stopping = false
-		close(stopDone)
-		c.mu.Unlock()
-		return err
-	}
-	if !leaderRunning {
-		return complete(c.stopTrackedTree(gracePeriod))
-	}
 
+	select {
+	case <-stopDone:
+		return false, c.stopResult()
+	case <-ctx.Done():
+	}
+	select {
+	case <-stopDone:
+		return false, c.stopResult()
+	default:
+	}
+	// The kill lets runStop's waits finish: the reaper sees the exit and the
+	// tree drains. Only a Done held open by output-pipe holders that procman
+	// cannot reach outlasts it, and runStop then waits on in the background.
+	return true, c.kill()
+}
+
+func (c *ExecCmd) stopResult() error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.stopErr
+}
+
+// runStop performs one stop operation and publishes its result to every caller
+// sharing it.
+func (c *ExecCmd) runStop(leaderRunning bool, doneChan, stopDone chan struct{}, gracePeriod time.Duration) {
+	var err error
+	if leaderRunning {
+		err = c.stopRunning(doneChan, gracePeriod)
+	} else {
+		err = c.stopTrackedTree(gracePeriod)
+	}
+	c.mu.Lock()
+	c.stopErr = err
+	c.stopping = false
+	close(stopDone)
+	c.mu.Unlock()
+}
+
+// stopRunning stops a command whose direct child is running: graceful signal,
+// grace period, then forced termination.
+func (c *ExecCmd) stopRunning(doneChan chan struct{}, gracePeriod time.Duration) error {
 	signalErr := gracefulSignal(c)
 	if signalErr != nil {
 		killErr := forceKill(c)
 		if killErr != nil {
-			return complete(errors.Join(signalErr, killErr))
+			return errors.Join(signalErr, killErr)
 		}
 		<-doneChan
-		return complete(signalErr)
+		return signalErr
 	}
 	if gracePeriod <= 0 {
 		<-doneChan
-		return complete(nil)
+		return nil
 	}
 
 	timer := time.NewTimer(gracePeriod)
@@ -798,16 +953,16 @@ func (c *ExecCmd) Stop() error {
 	case <-doneChan:
 	case <-timer.C:
 		if err := forceKill(c); err != nil {
-			return complete(err)
+			return err
 		}
 		<-doneChan
 		// Forced termination covered the whole tree; wait for it to drain.
 		<-c.treeDone
-		return complete(nil)
+		return nil
 	}
 	// The direct child exited within the grace period, but descendants may have
 	// ignored the graceful signal. Give them what is left of it.
-	return complete(c.awaitTree(timer.C))
+	return c.awaitTree(timer.C)
 }
 
 // stopTrackedTree stops what remains of a tree whose direct child has already
