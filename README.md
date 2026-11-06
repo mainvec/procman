@@ -456,6 +456,14 @@ working for reading its state and waiting on its channels.
 	is closed when the direct child is reaped, which kills any descendants.
 - Forced shutdown uses the platform's immediate process-kill operation.
 
+When procman uses a Job Object on Windows, it creates the child suspended,
+assigns it to the job, and only then resumes it, so the child cannot start
+a process outside the job. Resuming finds the child's initial thread through
+a Toolhelp thread snapshot. That snapshot covers every thread on the system,
+so it adds roughly 10ms to such a start on a typical machine. If the caller
+sets `CREATE_SUSPENDED` itself, procman assigns the job but leaves resuming
+to the caller.
+
 Windows graceful shutdown requires a console process that handles
 `CTRL_BREAK_EVENT`. GUI applications, Windows services, and detached processes
 need application-specific shutdown mechanisms.
@@ -478,8 +486,6 @@ Descendants:
 - With it, procman reaches only the command's process group (Unix) or Job
   Object (Windows). A descendant that leaves it, by `setsid`, `setpgid` or
   Job Object breakaway, is not stopped and not counted by `TreeDone`.
-- On Windows, a child can start processes between its creation and its
-  assignment to the Job Object; those escape the job.
 
 Parent-death cleanup:
 
