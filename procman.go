@@ -21,17 +21,25 @@ var (
 	// ErrParentDeathCleanupUnsupported indicates that the current platform
 	// cannot provide native cleanup after the parent process exits.
 	ErrParentDeathCleanupUnsupported = errors.New("parent-death cleanup is unsupported on this platform")
+	// ErrExecCmdNotFound indicates that no registered command has the given ID.
+	ErrExecCmdNotFound = errors.New("child process not found")
+	// ErrExecCmdActive indicates that a command cannot be removed because its
+	// direct child is running or its process tree is still tracked.
+	ErrExecCmdActive = errors.New("child process still active")
+	// ErrExecCmdRemoved indicates that Start was called on a command that had
+	// been removed from its Procman before it started.
+	ErrExecCmdRemoved = errors.New("child process removed")
 )
 
 // ExecCmdOption configures a command managed by Procman.
 type ExecCmdOption func(*execCmdOptions) error
 
 type execCmdOptions struct {
-	restartPolicy          RestartPolicy
 	gracePeriod            time.Duration
 	processTreeTermination bool
 	parentDeathCleanup     bool
 	orphanCleanup          bool
+	autoRemove             bool
 	onStart                func(*ExecCmd)
 	onExit                 func(*ExecCmd, error)
 	// future fields: Env, Dir, Stdout, Stderr, etc.
@@ -54,19 +62,6 @@ func WithDefaultExecCmdOptions(opts ...ExecCmdOption) ProcmanOption {
 				return err
 			}
 		}
-		return nil
-	}
-}
-
-// WithRestartPolicy selects the intended restart policy for a command.
-// Restart execution is not implemented yet.
-func WithRestartPolicy(p RestartPolicy) ExecCmdOption {
-	return func(o *execCmdOptions) error {
-		// validate
-		if p < RestartPolicyNever || p > RestartPolicyOnFailure {
-			return errors.New("invalid restart policy")
-		}
-		o.restartPolicy = p
 		return nil
 	}
 }
@@ -104,6 +99,19 @@ func WithProcessTreeTermination() ExecCmdOption {
 func WithOrphanCleanup() ExecCmdOption {
 	return func(o *execCmdOptions) error {
 		o.orphanCleanup = true
+		return nil
+	}
+}
+
+// WithAutoRemove removes the command from its Procman's registry once it has
+// finished: after its direct child has been reaped and nothing is left in its
+// tree, just before TreeDone closes. Without it, finished commands stay
+// registered, with everything they reference, until Remove is called. Holders
+// of the *ExecCmd can still use it after removal. Procman.OnExit callbacks are
+// delivered asynchronously and may run after the command has been removed.
+func WithAutoRemove() ExecCmdOption {
+	return func(o *execCmdOptions) error {
+		o.autoRemove = true
 		return nil
 	}
 }
@@ -218,19 +226,6 @@ type event struct {
 	err  error
 }
 
-// RestartPolicy selects when a command should be restarted after exit.
-// Restart execution is not implemented yet.
-type RestartPolicy int
-
-const (
-	// RestartPolicyNever disables automatic restart.
-	RestartPolicyNever RestartPolicy = iota
-	// RestartPolicyAlways requests restart after every exit.
-	RestartPolicyAlways
-	// RestartPolicyOnFailure requests restart only after unsuccessful exit.
-	RestartPolicyOnFailure
-)
-
 // ExecCmd is a single-start handle to a child process managed by Procman.
 // Its methods are safe for concurrent use unless otherwise documented.
 type ExecCmd struct {
@@ -253,11 +248,14 @@ type ExecCmd struct {
 	doneChan               chan struct{}
 	stopDone               chan struct{}
 	stopErr                error
-	restartPolicy          RestartPolicy
 	gracePeriod            time.Duration
 	processTreeTermination bool
 	parentDeathCleanup     bool
 	orphanCleanup          bool
+	autoRemove             bool
+	// removed is set once the command has left the registry. A removed command
+	// that never started cannot start: nothing would be able to stop it.
+	removed bool
 	// treeTracked is true from the moment the reaper finds the direct child's
 	// tree still populated until the tree is first observed empty. Only a
 	// tracked tree may be signalled once the direct child has been reaped.
@@ -272,16 +270,14 @@ type ExecCmd struct {
 
 // NewProcman creates a running Procman with default command behavior.
 func NewProcman() *Procman {
-	return newProcman(execCmdOptions{restartPolicy: RestartPolicyNever})
+	return newProcman(execCmdOptions{})
 }
 
 // NewProcmanWithOptions creates a running Procman with validated construction
 // options. It returns an error when a Procman option or default command option
 // is invalid or unsupported.
 func NewProcmanWithOptions(opts ...ProcmanOption) (*Procman, error) {
-	o := procmanOptions{
-		defaultExecCmdOptions: execCmdOptions{restartPolicy: RestartPolicyNever},
-	}
+	var o procmanOptions
 	for _, opt := range opts {
 		if err := opt(&o); err != nil {
 			return nil, err
@@ -425,10 +421,10 @@ func (p *Procman) NewExecCmdFromCmd(cmd *exec.Cmd, opts ...ExecCmdOption) (*Exec
 		status:                 ExecCmdStatusNotStarted,
 		doneChan:               make(chan struct{}),
 		treeDone:               make(chan struct{}),
-		restartPolicy:          o.restartPolicy,
 		processTreeTermination: o.processTreeTermination,
 		parentDeathCleanup:     o.parentDeathCleanup,
 		orphanCleanup:          o.orphanCleanup,
+		autoRemove:             o.autoRemove,
 		gracePeriod:            o.gracePeriod,
 		onStart:                o.onStart,
 		onExit:                 o.onExit,
@@ -450,14 +446,50 @@ func (p *Procman) GetExecCmd(id ID) (*ExecCmd, bool) {
 	return child, ok
 }
 
-func (p *Procman) removeExecCmd(id ID) {
+// Remove removes a finished or never-started command from the registry, so
+// that the Procman no longer retains it. A command is finished once TreeDone
+// has closed. Remove returns ErrExecCmdNotFound for an unknown ID, and
+// ErrExecCmdActive while the direct child runs or its tree is still tracked,
+// because StopAll, KillAll and Shutdown find commands through the registry. A
+// removed command that never started returns ErrExecCmdRemoved from Start.
+// Holders of the *ExecCmd can still read its state and channels.
+func (p *Procman) Remove(id ID) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	c, ok := p.execCmds[id]
+	if !ok {
+		return ErrExecCmdNotFound
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.started {
+		select {
+		case <-c.treeDone:
+		default:
+			return ErrExecCmdActive
+		}
+	}
+	c.removed = true
 	delete(p.execCmds, id)
+	return nil
+}
+
+// autoRemove is called by the reaper once the command has finished, before
+// TreeDone closes, so that anything observing TreeDone sees it removed.
+func (p *Procman) autoRemove(c *ExecCmd) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if p.execCmds[c.procmanId] == c {
+		delete(p.execCmds, c.procmanId)
+	}
+	c.removed = true
 }
 
 // ListExecCmdes returns a snapshot of all registered commands, including
-// commands that have not started and commands that have exited.
+// commands that have not started and finished commands that have not been
+// removed.
 func (p *Procman) ListExecCmdes() []*ExecCmd {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -587,6 +619,10 @@ func (c *ExecCmd) start() error {
 		c.mu.Unlock()
 		return ErrExecCmdAlreadyStarted
 	}
+	if c.removed {
+		c.mu.Unlock()
+		return ErrExecCmdRemoved
+	}
 	cmd := c.cmd
 	if err := prepareExecCmd(c); err != nil {
 		c.status = ExecCmdStatusFailed
@@ -650,6 +686,9 @@ func (c *ExecCmd) start() error {
 			}
 			c.trackTree()
 			cleanupExecCmd(c)
+		}
+		if c.autoRemove {
+			c.procman.autoRemove(c)
 		}
 		close(c.treeDone)
 	}()
