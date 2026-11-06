@@ -4,6 +4,7 @@ package procman
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"syscall"
 )
@@ -32,11 +33,30 @@ func finishExecCmdStart(child *ExecCmd) error {
 
 func cleanupExecCmd(child *ExecCmd) {}
 
+func validateStopSignal(sig syscall.Signal) error {
+	switch {
+	case sig <= 0:
+		return fmt.Errorf("invalid stop signal %d", int(sig))
+	case sig == syscall.SIGKILL || sig == syscall.SIGSTOP:
+		return fmt.Errorf("stop signal %v cannot be handled, so it cannot stop gracefully", sig)
+	}
+	return nil
+}
+
+// stopSignal is the command's graceful signal: SIGTERM unless WithStopSignal
+// chose another.
+func stopSignal(child *ExecCmd) syscall.Signal {
+	if child.stopSignal != 0 {
+		return child.stopSignal
+	}
+	return syscall.SIGTERM
+}
+
 func gracefulSignal(child *ExecCmd) error {
 	if child.processTreeTermination {
-		return signalProcessGroup(child.cmd.Process.Pid, syscall.SIGTERM)
+		return signalProcessGroup(child.cmd.Process.Pid, stopSignal(child))
 	}
-	return ignoreProcessDone(child.cmd.Process.Signal(syscall.SIGTERM))
+	return ignoreProcessDone(child.cmd.Process.Signal(stopSignal(child)))
 }
 
 func forceKill(child *ExecCmd) error {
@@ -77,7 +97,7 @@ func treeAlive(child *ExecCmd) bool {
 // reaped. Callers ensure the group has just been seen populated.
 func signalTree(child *ExecCmd, graceful bool) error {
 	if graceful {
-		return signalProcessGroup(child.cmd.Process.Pid, syscall.SIGTERM)
+		return signalProcessGroup(child.cmd.Process.Pid, stopSignal(child))
 	}
 	return signalProcessGroup(child.cmd.Process.Pid, syscall.SIGKILL)
 }

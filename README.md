@@ -256,6 +256,21 @@ Calling `Stop` before `Start` returns `procman.ErrExecCmdNotStarted`. Repeated
 concurrent calls wait for the same stop operation, including any wait for the
 process tree.
 
+On Unix the graceful signal is `SIGTERM`. `WithStopSignal` chooses another,
+for programs that expect, say, `SIGINT` or `SIGHUP`. With process-tree
+termination it goes to the whole process group. Forced termination is still
+`SIGKILL`, and `SIGKILL` and `SIGSTOP` are rejected as stop signals. On
+Windows the option fails with `procman.ErrStopSignalUnsupported`, because
+`CTRL_BREAK_EVENT` is the only console event that can be sent to a process
+group.
+
+```go
+cmd, err := pm.NewExecCmd("server", nil,
+	procman.WithStopSignal(syscall.SIGINT),
+	procman.WithGracePeriod(10*time.Second),
+)
+```
+
 `StopContext`, `StopAllContext`, and `ShutdownContext` bound the wait with a
 context. If the context ends first, procman forcibly terminates whatever is
 still running (the direct child, or the tracked tree it left behind) and
@@ -449,9 +464,8 @@ need application-specific shutdown mechanisms.
 
 Stopping and waiting:
 
-- The graceful signal is fixed: `SIGTERM` on Unix and `CTRL_BREAK_EVENT` on
-  Windows. Windows console processes are the only Windows processes that receive
-  it (see [Platform behavior](#platform-behavior)).
+- On Windows the graceful signal is always `CTRL_BREAK_EVENT`, and only
+  console processes receive it (see [Platform behavior](#platform-behavior)).
 - When `Stdout`/`Stderr` are writers, `Done` waits for every holder of the
   output pipes. Without process-tree termination, procman cannot reach holders
   that outlive the direct child; set `exec.Cmd.WaitDelay` to bound the wait. A

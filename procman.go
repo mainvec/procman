@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -31,6 +32,9 @@ var (
 	// ErrExecCmdRemoved indicates that Start was called on a command that had
 	// been removed from its Procman before it started.
 	ErrExecCmdRemoved = errors.New("child process removed")
+	// ErrStopSignalUnsupported indicates that WithStopSignal was used on a
+	// platform where the graceful stop signal cannot be chosen.
+	ErrStopSignalUnsupported = errors.New("stop signal cannot be configured on this platform")
 )
 
 // ExecCmdOption configures a command managed by Procman.
@@ -42,6 +46,7 @@ type execCmdOptions struct {
 	parentDeathCleanup     bool
 	orphanCleanup          bool
 	autoRemove             bool
+	stopSignal             syscall.Signal
 	onStart                func(*ExecCmd)
 	onExit                 func(*ExecCmd, error)
 	// future fields: Env, Dir, Stdout, Stderr, etc.
@@ -114,6 +119,23 @@ func WithOrphanCleanup() ExecCmdOption {
 func WithAutoRemove() ExecCmdOption {
 	return func(o *execCmdOptions) error {
 		o.autoRemove = true
+		return nil
+	}
+}
+
+// WithStopSignal sets the graceful signal sent by Stop, StopAll, Shutdown and
+// orphan cleanup, in place of SIGTERM. With WithProcessTreeTermination it goes
+// to the whole process group, including what remains of a tracked tree. Forced
+// termination is still SIGKILL. SIGKILL and SIGSTOP are rejected: neither can
+// be handled, so neither is a graceful request. On Windows, which has no
+// group-addressable alternative to CTRL_BREAK_EVENT, it returns
+// ErrStopSignalUnsupported.
+func WithStopSignal(sig syscall.Signal) ExecCmdOption {
+	return func(o *execCmdOptions) error {
+		if err := validateStopSignal(sig); err != nil {
+			return err
+		}
+		o.stopSignal = sig
 		return nil
 	}
 }
@@ -260,6 +282,7 @@ type ExecCmd struct {
 	parentDeathCleanup     bool
 	orphanCleanup          bool
 	autoRemove             bool
+	stopSignal             syscall.Signal
 	// removed is set once the command has left the registry. A removed command
 	// that never started cannot start: nothing would be able to stop it.
 	removed bool
@@ -432,6 +455,7 @@ func (p *Procman) NewExecCmdFromCmd(cmd *exec.Cmd, opts ...ExecCmdOption) (*Exec
 		parentDeathCleanup:     o.parentDeathCleanup,
 		orphanCleanup:          o.orphanCleanup,
 		autoRemove:             o.autoRemove,
+		stopSignal:             o.stopSignal,
 		gracePeriod:            o.gracePeriod,
 		onStart:                o.onStart,
 		onExit:                 o.onExit,
