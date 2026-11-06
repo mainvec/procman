@@ -82,9 +82,14 @@ func signalTree(child *ExecCmd, graceful bool) error {
 	return signalProcessGroup(child.cmd.Process.Pid, syscall.SIGKILL)
 }
 
+// signalProcessGroup signals every member of a process group. ESRCH (no
+// members left) and EPERM (no member could be signalled) both mean there is
+// nothing left to act on, as treeAlive treats them. EPERM is not only a
+// permission problem: macOS returns it for a group whose members are all
+// zombies, as a group is between being killed and its leader being reaped.
 func signalProcessGroup(pid int, signal syscall.Signal) error {
 	err := syscall.Kill(-pid, signal)
-	if errors.Is(err, syscall.ESRCH) {
+	if errors.Is(err, syscall.ESRCH) || errors.Is(err, syscall.EPERM) {
 		return nil
 	}
 	return err
